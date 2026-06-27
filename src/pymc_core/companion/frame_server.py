@@ -139,6 +139,11 @@ from .models import Contact, QueuedMessage
 
 logger = logging.getLogger("CompanionFrameServer")
 
+# First bytes of common HTTP request methods (GET, POST/PUT/PATCH, HEAD, DELETE,
+# OPTIONS, TRACE, CONNECT). Used to give a friendlier rejection message when a
+# browser or HTTP probe is pointed at the raw binary frame port.
+_HTTP_FIRST_BYTES = frozenset(b"GPHDOTC")
+
 
 def _build_advert_push_frames(contact: Contact) -> tuple[bytes, Optional[bytes]]:
     """Build PUSH_CODE_ADVERT short frame and optional PUSH_CODE_NEW_ADVERT
@@ -200,6 +205,7 @@ class CompanionFrameServer:
         control_handler: Optional[Any] = None,
         heartbeat_interval: int = 15,
         client_idle_timeout_sec: Optional[int] = 8 * 60 * 60,
+        handshake_timeout_sec: Optional[float] = 10.0,
     ):
         self.bridge = bridge
         self.companion_hash = companion_hash
@@ -210,6 +216,10 @@ class CompanionFrameServer:
         self._control_handler = control_handler
         self._heartbeat_interval = heartbeat_interval
         self._client_idle_timeout_sec = client_idle_timeout_sec
+        # Window a new connection has to send its first valid frame byte before
+        # it is dropped. Until that byte arrives the connection is on probation
+        # and cannot evict the active client (see _handle_client).
+        self._handshake_timeout_sec = handshake_timeout_sec
         self._server: Optional[asyncio.Server] = None
         self._client_writer: Optional[asyncio.StreamWriter] = None
         self._client_reader: Optional[asyncio.StreamReader] = None
@@ -860,10 +870,57 @@ class CompanionFrameServer:
         self, reader: asyncio.StreamReader, writer: asyncio.StreamWriter
     ) -> None:
         """Handle a new client connection.  One client at a time.
-        If a client is already connected, the existing connection is closed
-        and the new one is accepted (eviction). An idle read timeout also
-        frees the slot when no data is received for client_idle_timeout_sec.
+
+        A new connection is on *probation*: it must prove it speaks the frame
+        protocol — its first byte must be ``FRAME_INBOUND_PREFIX`` — before it
+        may take over the single client slot. Connections that send anything
+        else (HTTP probes, TLS, port scanners) are rejected and closed
+        *without* disturbing the currently-attached client; only after a valid
+        prefix is received is any existing client evicted and the new one
+        promoted. An idle read timeout also frees the slot when no data is
+        received for client_idle_timeout_sec.
         """
+        # -- Probation: validate the first byte before touching shared state. --
+        self._configure_socket(writer)
+        try:
+            pending_prefix: Optional[bytes] = await asyncio.wait_for(
+                reader.read(1), timeout=self._handshake_timeout_sec
+            )
+        except asyncio.TimeoutError:
+            logger.info(
+                "New connection sent no data within handshake window; "
+                "rejecting without evicting active client (port=%s)",
+                self.port,
+            )
+            await self._close_writer_quietly(writer)
+            return
+        except (ConnectionResetError, BrokenPipeError, asyncio.IncompleteReadError) as e:
+            logger.info(
+                "Connection dropped during handshake (port=%s): %s",
+                self.port,
+                type(e).__name__,
+            )
+            await self._close_writer_quietly(writer)
+            return
+        except Exception as e:
+            logger.warning("Error during companion handshake read (port=%s): %s", self.port, e)
+            await self._close_writer_quietly(writer)
+            return
+        if not pending_prefix:
+            await self._close_writer_quietly(writer)
+            return
+        if pending_prefix[0] != FRAME_INBOUND_PREFIX:
+            logger.warning(
+                "Rejecting non-frame connection on companion port %s "
+                "(first byte 0x%02x%s); active client preserved",
+                self.port,
+                pending_prefix[0],
+                self._describe_first_byte(pending_prefix[0]),
+            )
+            await self._reject_http(writer, pending_prefix[0])
+            return
+
+        # -- Valid frame client: now (and only now) evict any existing client. --
         if self._client_writer:
             logger.info(
                 "Companion already has a client; evicting previous connection (port=%s)",
@@ -890,7 +947,6 @@ class CompanionFrameServer:
 
         self._client_reader = reader
         self._client_writer = writer
-        self._configure_socket(writer)
         local_write_queue: asyncio.Queue = asyncio.Queue(maxsize=self._WRITE_QUEUE_MAXSIZE)
         self._write_queue = local_write_queue
         self._setup_push_callbacks()
@@ -901,16 +957,21 @@ class CompanionFrameServer:
         disconnect_reason: Optional[str] = None
         try:
             while True:
-                try:
-                    prefix = await asyncio.wait_for(
-                        reader.read(1), timeout=self._client_idle_timeout_sec
-                    )
-                except asyncio.TimeoutError:
-                    disconnect_reason = "idle_timeout"
-                    break
-                if not prefix:
-                    disconnect_reason = "empty_read"
-                    break
+                if pending_prefix is not None:
+                    # First frame: prefix already consumed during probation.
+                    prefix = pending_prefix
+                    pending_prefix = None
+                else:
+                    try:
+                        prefix = await asyncio.wait_for(
+                            reader.read(1), timeout=self._client_idle_timeout_sec
+                        )
+                    except asyncio.TimeoutError:
+                        disconnect_reason = "idle_timeout"
+                        break
+                    if not prefix:
+                        disconnect_reason = "empty_read"
+                        break
                 if prefix[0] != FRAME_INBOUND_PREFIX:
                     logger.warning("Invalid frame prefix: 0x%02x", prefix[0])
                     continue
@@ -974,6 +1035,45 @@ class CompanionFrameServer:
                     self.port,
                     disconnect_reason or "unknown",
                 )
+
+    @staticmethod
+    def _describe_first_byte(first_byte: int) -> str:
+        """Return a short hint suffix for a rejected first byte (empty unless HTTP-like)."""
+        if first_byte in _HTTP_FIRST_BYTES:
+            return (
+                " — looks like an HTTP request; this is the binary frame port, "
+                "use the repeater web UI's HTTP port instead"
+            )
+        return ""
+
+    @staticmethod
+    async def _close_writer_quietly(writer: asyncio.StreamWriter) -> None:
+        """Close a writer, swallowing any teardown errors."""
+        try:
+            writer.close()
+            await writer.wait_closed()
+        except Exception:
+            pass
+
+    async def _reject_http(self, writer: asyncio.StreamWriter, first_byte: int) -> None:
+        """Close a rejected connection, sending a tiny HTTP hint if it looked like HTTP."""
+        if first_byte in _HTTP_FIRST_BYTES:
+            try:
+                body = (
+                    b"This is the pyMC companion binary frame port, not an HTTP server.\n"
+                    b"Use the repeater web UI on its HTTP port instead.\n"
+                )
+                writer.write(
+                    b"HTTP/1.1 426 Upgrade Required\r\n"
+                    b"Content-Type: text/plain\r\n"
+                    b"Connection: close\r\n"
+                    b"Content-Length: " + str(len(body)).encode("ascii") + b"\r\n"
+                    b"\r\n" + body
+                )
+                await writer.drain()
+            except Exception:
+                pass
+        await self._close_writer_quietly(writer)
 
     # -------------------------------------------------------------------------
     # Command dispatch

@@ -777,31 +777,6 @@ async def test_cmd_send_telemetry_req_failure_no_empty_push():
     assert not any(f[0] == PUSH_CODE_TELEMETRY_RESPONSE for f in frames)
 
 
-class _BlockingReader:
-    """Reader that blocks until released, then returns EOF."""
-
-    def __init__(self, release_event: asyncio.Event):
-        self._release_event = release_event
-
-    async def read(self, _n: int) -> bytes:
-        await self._release_event.wait()
-        return b""
-
-    async def readexactly(self, n: int) -> bytes:
-        raise asyncio.IncompleteReadError(partial=b"", expected=n)
-
-
-class _NeverReader:
-    """Reader that never returns (for idle-timeout path)."""
-
-    async def read(self, _n: int) -> bytes:
-        await asyncio.sleep(3600)
-        return b""
-
-    async def readexactly(self, n: int) -> bytes:
-        raise asyncio.IncompleteReadError(partial=b"", expected=n)
-
-
 class _RaisingReader:
     """Reader that raises a socket-style exception on read()."""
 
@@ -813,6 +788,47 @@ class _RaisingReader:
 
     async def readexactly(self, n: int) -> bytes:
         raise self._exc
+
+
+class _ScriptReader:
+    """Serves a fixed byte script, then behaves per ``on_empty``.
+
+    Lets ``_handle_client`` tests drive the new validate-before-evict probation:
+    a client is promoted only after its first byte (``0x3C``) is read.
+
+    on_empty:
+      - ``"eof"``   return b"" immediately when the script is exhausted
+      - ``"hang"``  await forever (exercises read/idle timeouts)
+      - ``"event"`` await ``block_event`` then EOF (simulates a connected,
+                    quiet client that can be evicted)
+    """
+
+    def __init__(self, data: bytes = b"", *, on_empty: str = "eof", block_event=None):
+        self._buf = bytearray(data)
+        self._on_empty = on_empty
+        self._block_event = block_event
+
+    async def _drain_empty(self) -> bytes:
+        if self._on_empty == "hang":
+            await asyncio.sleep(3600)
+        elif self._on_empty == "event" and self._block_event is not None:
+            await self._block_event.wait()
+        return b""
+
+    async def read(self, n: int) -> bytes:
+        if not self._buf:
+            return await self._drain_empty()
+        chunk = bytes(self._buf[:n])
+        del self._buf[:n]
+        return chunk
+
+    async def readexactly(self, n: int) -> bytes:
+        if len(self._buf) < n:
+            await self._drain_empty()
+            raise asyncio.IncompleteReadError(partial=bytes(self._buf), expected=n)
+        chunk = bytes(self._buf[:n])
+        del self._buf[:n]
+        return chunk
 
 
 class _DummyWriter:
@@ -849,8 +865,10 @@ async def test_evicted_handler_cleanup_does_not_cancel_new_writer_task():
 
     first_release = asyncio.Event()
     second_release = asyncio.Event()
-    reader1 = _BlockingReader(first_release)
-    reader2 = _BlockingReader(second_release)
+    # Each client sends a valid prefix (so it is promoted past probation), then
+    # blocks until released — mirroring a connected client awaiting more data.
+    reader1 = _ScriptReader(b"\x3c", on_empty="event", block_event=first_release)
+    reader2 = _ScriptReader(b"\x3c", on_empty="event", block_event=second_release)
     writer1 = _DummyWriter()
     writer2 = _DummyWriter()
 
@@ -892,7 +910,9 @@ async def test_handle_client_idle_timeout_disconnects_cleanly(caplog):
     bridge.get_time = Mock(return_value=0)
     server = CompanionFrameServer(bridge, "hash", port=0, client_idle_timeout_sec=0.01)
 
-    await server._handle_client(_NeverReader(), _DummyWriter())
+    # Promote past probation with one complete (unknown-cmd) frame, then go idle.
+    reader = _ScriptReader(b"\x3c\x01\x00\x00", on_empty="hang")
+    await server._handle_client(reader, _DummyWriter())
 
     assert server._client_writer is None
     assert server._client_reader is None
@@ -914,6 +934,104 @@ async def test_handle_client_connection_reset_disconnects_cleanly(caplog):
     assert server._client_reader is None
     assert server._writer_task is None
     assert any("ConnectionResetError" in rec.message for rec in caplog.records)
+
+
+async def _promote_client(server, *, block_event):
+    """Start a valid frame client and wait until it owns the single client slot."""
+    reader = _ScriptReader(b"\x3c", on_empty="event", block_event=block_event)
+    writer = _DummyWriter()
+    task = asyncio.create_task(server._handle_client(reader, writer))
+    for _ in range(50):
+        if server._client_writer is writer and server._writer_task is not None:
+            break
+        await asyncio.sleep(0)
+    assert server._client_writer is writer
+    return task, writer
+
+
+@pytest.mark.asyncio
+async def test_http_probe_does_not_evict_active_client(caplog):
+    """An HTTP request to the frame port is rejected without evicting the active client."""
+    caplog.set_level(logging.WARNING, logger="CompanionFrameServer")
+    bridge = Mock()
+    bridge.get_time = Mock(return_value=0)
+    server = CompanionFrameServer(bridge, "hash", port=0, client_idle_timeout_sec=None)
+
+    release = asyncio.Event()
+    task, writer_a = await _promote_client(server, block_event=release)
+
+    # Browser/probe speaks HTTP; runs to completion (rejected on first byte).
+    http_reader = _ScriptReader(b"GET / HTTP/1.1\r\nHost: x\r\n\r\n", on_empty="eof")
+    http_writer = _DummyWriter()
+    await server._handle_client(http_reader, http_writer)
+
+    # Active client untouched; probe closed; a single rejection warning (not per-byte).
+    assert server._client_writer is writer_a
+    assert http_writer.closed is True
+    rejects = [r for r in caplog.records if "Rejecting non-frame connection" in r.message]
+    assert len(rejects) == 1
+
+    release.set()
+    await task
+
+
+@pytest.mark.asyncio
+async def test_valid_second_client_still_evicts(caplog):
+    """A valid frame client still evicts the previous one (reconnect-over-stale-socket)."""
+    caplog.set_level(logging.INFO, logger="CompanionFrameServer")
+    bridge = Mock()
+    bridge.get_time = Mock(return_value=0)
+    server = CompanionFrameServer(bridge, "hash", port=0, client_idle_timeout_sec=None)
+
+    release_a = asyncio.Event()
+    release_b = asyncio.Event()
+    task_a, writer_a = await _promote_client(server, block_event=release_a)
+    task_b, writer_b = await _promote_client(server, block_event=release_b)
+
+    assert server._client_writer is writer_b
+    assert writer_a.closed is True
+
+    release_a.set()
+    release_b.set()
+    await asyncio.gather(task_a, task_b)
+
+
+@pytest.mark.asyncio
+async def test_silent_connection_times_out_without_eviction(caplog):
+    """A connection that sends nothing is dropped on handshake timeout, active client kept."""
+    caplog.set_level(logging.INFO, logger="CompanionFrameServer")
+    bridge = Mock()
+    bridge.get_time = Mock(return_value=0)
+    server = CompanionFrameServer(
+        bridge, "hash", port=0, client_idle_timeout_sec=None, handshake_timeout_sec=0.01
+    )
+
+    release = asyncio.Event()
+    task, writer_a = await _promote_client(server, block_event=release)
+
+    silent_writer = _DummyWriter()
+    await server._handle_client(_ScriptReader(b"", on_empty="hang"), silent_writer)
+
+    assert server._client_writer is writer_a
+    assert silent_writer.closed is True
+    assert any("handshake window" in r.message for r in caplog.records)
+
+    release.set()
+    await task
+
+
+@pytest.mark.asyncio
+async def test_first_frame_processed_after_promotion():
+    """The prefix byte consumed during probation is not lost; the first command dispatches."""
+    server = CompanionFrameServer(Mock(), "hash", port=0, client_idle_timeout_sec=None)
+    server._handle_cmd = AsyncMock()
+
+    # prefix(0x3C) + len=1 (LE) + payload byte 0x05, then EOF.
+    reader = _ScriptReader(b"\x3c\x01\x00\x05", on_empty="eof")
+    await server._handle_client(reader, _DummyWriter())
+
+    server._handle_cmd.assert_awaited_once()
+    assert server._handle_cmd.await_args.args[0] == b"\x05"
 
 
 @pytest.mark.asyncio
