@@ -1041,8 +1041,10 @@ class TestLoginReplyRoute:
 
     @pytest.mark.asyncio
     async def test_short_out_path_buffer_is_rejected(self):
-        """``set_path`` stores the buffer verbatim, so a path shorter than its
-        declared hop count would put uninitialised bytes on the air."""
+        """``set_path`` stores the buffer verbatim while ``path_len`` keeps the
+        declared count, so a short path makes ``write_to`` raise ``path_len
+        mismatch`` and the reply is never transmitted. Falling back to a flood
+        costs the direct route but still delivers."""
         _out_path, out_path_len = self._two_hop_path()  # declares 4 bytes
         server, client = LocalIdentity(), LocalIdentity()
         handler, sent = _login_handler(
@@ -1090,3 +1092,166 @@ class TestLoginReplyRoute:
 
         await handler(_build_login_req(server, client, route_type=ROUTE_TYPE_DIRECT))
         assert seen == [client.get_public_key()]
+
+    @pytest.mark.asyncio
+    async def test_scoped_direct_login_with_out_path_is_not_scoped_or_restamped(self):
+        """The DIRECT branch's two guards, with a request that actually captured
+        a region -- without this the guards are unreachable and deleting them
+        leaves the suite green.
+
+        A DIRECT request can still arrive TRANSPORT_FLOOD-scoped (a repeater
+        re-broadcast it under a Region), so ``apply_reply_scope`` would have a
+        real key to stamp. A sendDirect must carry neither that scope nor the
+        request's path-hash width.
+        """
+        a_key = get_auto_key_for("#region-a")
+        region_map = RegionMap([RegionEntry(id=1, name="#region-a")])
+        out_path, out_path_len = self._two_hop_path()
+        server, client = LocalIdentity(), LocalIdentity()
+        handler, sent = _login_handler(
+            server, get_client_fn=lambda _pub: _AclClient(out_path, out_path_len)
+        )
+
+        req = _build_login_req(server, client, region_key=a_key)
+        req.header = (req.header & ~0x03) | ROUTE_TYPE_DIRECT  # scoped, then routed direct
+        capture_recv_region(region_map, req)
+        assert req._recv_region_key is None  # direct => no codes to match on
+
+        await handler(req)
+        reply = sent[0]
+        assert reply.get_route_type() == ROUTE_TYPE_DIRECT
+        assert reply.transport_codes == [0, 0]
+        assert reply._flood_scope_applied is False
+        # The stored path's own width survived; the request's was not stamped on.
+        assert reply.path_len == out_path_len
+        assert reply._path_hash_mode_applied is False
+
+    @pytest.mark.asyncio
+    async def test_a_scoped_flood_login_still_scopes_its_path_return(self):
+        """Cross-check for the test above: on the flood branch both calls do run,
+        so the same RegionMap does scope the reply."""
+        a_key = get_auto_key_for("#region-a")
+        region_map = RegionMap([RegionEntry(id=1, name="#region-a")])
+        server, client = LocalIdentity(), LocalIdentity()
+        handler, sent = _login_handler(server, get_client_fn=lambda _pub: _AclClient())
+
+        req = _build_login_req(server, client, region_key=a_key)
+        capture_recv_region(region_map, req)
+        await handler(req)
+
+        reply = sent[0]
+        assert reply.get_route_type() == ROUTE_TYPE_TRANSPORT_FLOOD
+        assert reply.transport_codes[0] == calc_transport_code(a_key, reply)
+        assert reply._flood_scope_applied is True
+
+    @pytest.mark.asyncio
+    async def test_a_malformed_out_path_never_costs_the_reply(self):
+        """An application ACL must not be able to kill the login reply. The
+        pre-change handler always sent one; every unusable shape must still.
+
+        ``contact_store`` persists ``out_path`` as a hex *string*, so an ACL
+        backed by that on-disk shape is not hypothetical.
+        """
+        _p, good_len = self._two_hop_path()
+
+        class _HexStr:
+            out_path = "a1a2b1b2"
+
+        class _BadList:
+            out_path = [0xA1, 999, 0xB1, 0xB2]
+
+        class _RaisesOnRead:
+            @property
+            def out_path(self):
+                raise RuntimeError("ACL exploded")
+
+        class _LenExplodes:
+            out_path = b"\xa1\xa2\xb1\xb2"
+
+            @property
+            def out_path_len(self):
+                raise RuntimeError("ACL exploded")
+
+        _HexStr.out_path_len = good_len
+        _BadList.out_path_len = good_len
+        _RaisesOnRead.out_path_len = good_len
+
+        for shape in (_HexStr, _BadList, _RaisesOnRead, _LenExplodes):
+            client_info = shape()
+            server, client = LocalIdentity(), LocalIdentity()
+            handler, sent = _login_handler(server, get_client_fn=lambda _pub: client_info)
+
+            await handler(_build_login_req(server, client, route_type=ROUTE_TYPE_DIRECT))
+            assert len(sent) == 1, f"{shape.__name__} produced no login reply"
+            assert sent[0].get_route_type() == ROUTE_TYPE_FLOOD
+
+    @pytest.mark.asyncio
+    async def test_flood_login_leaves_a_pathless_client_object_alone(self):
+        """An app ACL that models only permissions must not have routing fields
+        grafted onto it by a flood login."""
+
+        class _PermsOnly:
+            permissions = 0x03
+
+        client_info = _PermsOnly()
+        server, client = LocalIdentity(), LocalIdentity()
+        handler, sent = _login_handler(server, get_client_fn=lambda _pub: client_info)
+
+        await handler(_build_login_req(server, client, route_type=ROUTE_TYPE_FLOOD))
+        assert len(sent) == 1
+        assert not hasattr(client_info, "out_path_len")
+
+    @pytest.mark.asyncio
+    async def test_a_raising_out_path_len_never_costs_a_flood_reply(self):
+        """``hasattr`` only swallows AttributeError, so the invalidation probe
+        has to sit inside the guard or an exploding ACL property kills the
+        PATH return."""
+
+        class _LenExplodes:
+            @property
+            def out_path_len(self):
+                raise RuntimeError("ACL exploded")
+
+        server, client = LocalIdentity(), LocalIdentity()
+        handler, sent = _login_handler(server, get_client_fn=lambda _pub: _LenExplodes())
+
+        await handler(_build_login_req(server, client, route_type=ROUTE_TYPE_FLOOD))
+        assert len(sent) == 1
+        assert sent[0].get_payload_type() == PAYLOAD_TYPE_PATH
+
+    @pytest.mark.asyncio
+    async def test_flood_login_clears_both_halves_of_the_stored_path(self):
+        """Length and buffer are cleared together, so nothing reading the pair
+        (the REQ handler, PacketBuilder) sees a half-cleared record."""
+        out_path, out_path_len = self._two_hop_path()
+        client_info = _AclClient(out_path, out_path_len)
+        server, client = LocalIdentity(), LocalIdentity()
+        handler, _sent = _login_handler(server, get_client_fn=lambda _pub: client_info)
+
+        await handler(_build_login_req(server, client, route_type=ROUTE_TYPE_FLOOD))
+        assert client_info.out_path_len == -1
+        assert bytes(client_info.out_path) == b""
+
+    @pytest.mark.asyncio
+    async def test_zero_hop_out_path_keeps_its_declared_width(self):
+        """A client that is a direct neighbour has a 0-hop out_path, and 0 hops
+        is exactly where ``apply_path_hash_mode`` stops being a no-op -- so this
+        is the case where mirroring the request's width onto a sendDirect would
+        actually corrupt the reply's ``path_len``.
+        """
+        out_path_len = PathUtils.encode_path_len(2, 0)  # 2-byte hashes, no hops
+        assert PathUtils.get_path_byte_len(out_path_len) == 0
+        server, client = LocalIdentity(), LocalIdentity()
+        handler, sent = _login_handler(
+            server, get_client_fn=lambda _pub: _AclClient(b"", out_path_len)
+        )
+
+        req = _build_login_req(server, client, route_type=ROUTE_TYPE_DIRECT)
+        assert PathUtils.get_path_hash_size(req.path_len) == 1  # would restamp to 1
+        await handler(req)
+
+        reply = sent[0]
+        assert reply.get_route_type() == ROUTE_TYPE_DIRECT
+        assert reply.path_len == out_path_len
+        assert reply._path_hash_mode_applied is False
+        reply.write_to()  # declared width and buffer agree

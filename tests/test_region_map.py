@@ -74,7 +74,7 @@ class TestWildcardRegion:
 
     def test_wildcard_defaults_allow_flood(self):
         rmap = RegionMap([RegionEntry(id=1, name="#region-a")])
-        wildcard = rmap.get_wildcard()
+        wildcard = rmap.wildcard
         assert wildcard.is_wildcard() is True
         assert wildcard.id == 0
         assert wildcard.name == "*"
@@ -91,8 +91,24 @@ class TestWildcardRegion:
 
     def test_wildcard_flags_are_configurable(self):
         rmap = RegionMap()
-        rmap.get_wildcard().flags = REGION_DENY_FLOOD
+        rmap.wildcard.flags = REGION_DENY_FLOOD
         assert rmap.wildcard.flags & REGION_DENY_FLOOD
 
     def test_ordinary_regions_are_not_wildcards(self):
         assert RegionEntry(id=7, name="#region-a").is_wildcard() is False
+
+    def test_a_registered_id_zero_region_is_treated_as_the_wildcard(self):
+        """Firmware tests ``isWildcard()`` on a ``findMatch`` result before it
+        resolves any key. Its ids come from ``next_id`` so id 0 never reaches
+        ``regions[]``, but nothing here stops an application registering one --
+        so the same precedence has to hold, or a reply firmware sends plain
+        would go out scoped."""
+        from openhop_core.protocol.region_map import capture_recv_region
+
+        rmap = RegionMap([RegionEntry(id=0, name="#looks-ordinary")])
+        pkt = _make_scoped_packet("#looks-ordinary")
+        assert rmap.find_match(pkt, mask=REGION_DENY_FLOOD) is not None
+
+        capture_recv_region(rmap, pkt)
+        assert pkt._recv_region_key is None
+        assert pkt._recv_region_unscoped is True

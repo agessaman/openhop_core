@@ -38,7 +38,14 @@ class RegionMap:
         # outside ``regions[]``: ``findMatch`` never returns it, but an un-scoped
         # FLOOD is considered to have arrived "under" it unless its flags deny
         # flood. Defaults mirror ``RegionMap::RegionMap`` (id/parent 0, flags 0
-        # = allow, name "*"). Callers set ``wildcard.flags`` to configure it.
+        # = allow, name "*"). Applications set ``wildcard.flags`` to configure it.
+        #
+        # Scope: REGION_DENY_FLOOD here affects only how a *reply* is scoped
+        # (see capture_recv_region). Firmware also consults recv_pkt_region in
+        # the repeater's allowPacketForward to refuse relaying a flood whose
+        # region is unresolved; this port has no repeater allowPacketForward at
+        # all (forwarding is the companion's client-repeat gate), so setting the
+        # flag does not stop un-scoped floods being relayed.
         self.wildcard: RegionEntry = RegionEntry(id=0, parent=0, flags=0, name="*")
 
     # ------------------------------------------------------------------
@@ -53,10 +60,6 @@ class RegionMap:
     @property
     def regions(self) -> list[RegionEntry]:
         return list(self._regions)
-
-    def get_wildcard(self) -> RegionEntry:
-        """Return the root/wildcard Region (MeshCore ``RegionMap::getWildcard``)."""
-        return self.wildcard
 
     # ------------------------------------------------------------------
     # Matching helpers
@@ -177,10 +180,20 @@ def capture_recv_region(region_map: Optional[RegionMap], pkt: Packet) -> None:
     route_type = pkt.get_route_type()
     if route_type == ROUTE_TYPE_TRANSPORT_FLOOD:
         entry = region_map.find_match(pkt, mask=REGION_DENY_FLOOD)
-        pkt._recv_region_key = region_map.first_key_for(entry)
+        # Firmware tests isWildcard() on the match before resolving any key, and
+        # treats a wildcard match as un-scoped. Its findMatch cannot return the
+        # wildcard (ids are handed out from next_id, so nothing in regions[] has
+        # id 0), but nothing here stops an application registering a RegionEntry
+        # with id 0, so honour the same precedence rather than scoping a reply
+        # firmware would have sent plain.
+        if entry is not None and entry.is_wildcard():
+            pkt._recv_region_key = None
+            pkt._recv_region_unscoped = True
+        else:
+            pkt._recv_region_key = region_map.first_key_for(entry)
     elif route_type == ROUTE_TYPE_FLOOD:
         pkt._recv_region_key = None
-        pkt._recv_region_unscoped = not (region_map.get_wildcard().flags & REGION_DENY_FLOOD)
+        pkt._recv_region_unscoped = not (region_map.wildcard.flags & REGION_DENY_FLOOD)
     else:
         pkt._recv_region_key = None
 

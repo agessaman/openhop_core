@@ -271,36 +271,68 @@ class LoginServerHandler(BaseHandler):
         if client is None:
             return
         try:
+            # Probe inside the try: hasattr only swallows AttributeError, so an
+            # ACL property raising anything else would escape and, via the
+            # caller's except, cost the reply entirely.
+            if not hasattr(client, "out_path_len"):
+                # Never graft a routing field onto an app object that does not
+                # model one.
+                return
             if getattr(client, "out_path_len", -1) >= 0:
                 self.log("[LoginServer] Flood login: clearing stored out_path")
             client.out_path_len = -1
+            # Clear the buffer too, so nothing else reading the pair sees a
+            # half-cleared record (firmware's ClientInfo owns both fields).
+            if hasattr(client, "out_path"):
+                client.out_path = type(client.out_path)()
         except Exception as e:
             self.log(f"[LoginServer] Could not clear stored out_path: {e}")
 
-    @staticmethod
-    def _known_out_path(client) -> tuple[Optional[bytes], int]:
+    def _known_out_path(self, client) -> tuple[Optional[bytes], int]:
         """Return ``(out_path, encoded_len)`` for a client, or ``(None, -1)``.
 
-        Mirrors firmware's ``client->out_path_len != OUT_PATH_UNKNOWN`` test, plus
-        the same validity guards the REQ handler applies: the encoded length must
-        decode, and the stored bytes must actually cover the hop count it declares
-        (``Packet.set_path`` stores the buffer verbatim, so a short one would put
-        uninitialised path bytes on the air).
+        Mirrors firmware's ``client->out_path_len != OUT_PATH_UNKNOWN`` test.
+        Beyond it, two guards, because ``out_path``/``out_path_len`` are supplied
+        by the application's ACL and firmware's fixed ``ClientInfo`` gives no
+        equivalent freedom:
+
+        * the encoded length must decode (``is_valid_path_len``);
+        * the stored bytes must cover the hop count that length declares.
+          ``Packet.set_path`` stores the buffer verbatim while ``path_len`` keeps
+          the declared count, and ``Packet.write_to`` rejects the mismatch with
+          ``ValueError: path_len mismatch`` — so an over- or under-long buffer
+          means the reply is never transmitted at all.
+
+        Anything unusable falls back to ``(None, -1)`` and the caller floods, so
+        a malformed ACL entry costs the direct route but never the reply itself.
+        Note that ``ProtocolRequestHandler`` and the text-ACK path apply only the
+        first of these two guards today, and ``ReturnPathHandler._known_out_path``
+        applies both -- four near-identical copies of this validation live in the
+        tree. Consolidating them into one ``PathUtils`` helper is worth doing, but
+        it reaches well past this port.
         """
         if client is None:
             return None, -1
-        raw_len = getattr(client, "out_path_len", -1)
         try:
+            raw_len = getattr(client, "out_path_len", -1)
             out_path_len = -1 if raw_len is None else int(raw_len)
-        except (TypeError, ValueError):
+            if out_path_len < 0 or not PathUtils.is_valid_path_len(out_path_len):
+                return None, -1
+            out_path = bytes(getattr(client, "out_path", b"") or b"")
+            expected = PathUtils.get_path_byte_len(out_path_len)
+            if len(out_path) < expected:
+                self.log(
+                    f"[LoginServer] Stored out_path is {len(out_path)}B but path_len "
+                    f"0x{out_path_len:02X} declares {expected}B -- flooding instead"
+                )
+                return None, -1
+            return out_path[:expected], out_path_len
+        except Exception as e:
+            # An application ACL must not be able to kill the login reply --
+            # same invariant _lookup_client states. e.g. an out_path persisted
+            # as a hex string (contact_store's on-disk shape) would raise here.
+            self.log(f"[LoginServer] Unusable stored out_path ({e}) -- flooding instead")
             return None, -1
-        if out_path_len < 0 or not PathUtils.is_valid_path_len(out_path_len):
-            return None, -1
-        out_path = bytes(getattr(client, "out_path", b"") or b"")
-        expected = PathUtils.get_path_byte_len(out_path_len)
-        if len(out_path) < expected:
-            return None, -1
-        return out_path[:expected], out_path_len
 
     async def _send_login_response(
         self,
@@ -448,6 +480,11 @@ class LoginServerHandler(BaseHandler):
             # region the request arrived under. Skipped for the out_path branch:
             # that is a sendDirect, which firmware never routes through
             # sendFloodReply and which carries no transport codes.
+            #
+            # Belt and braces as things stand -- on a DIRECT packet the helper
+            # can only set _flood_scope_applied, which the dispatcher ignores for
+            # anything that is not a plain FLOOD. The guard states the intent, so
+            # that stays true if apply_reply_scope grows a wider effect.
             if out_path is None:
                 apply_reply_scope(response_pkt, original_packet)
 
