@@ -9,6 +9,14 @@ OH-026: capture the region a request arrived under on the Packet, and scope a
 
 Both parts share one ``scope_packet`` primitive and the ``_flood_scope_applied``
 double-scope gate.
+
+Upstream MeshCore PR #3106 ("Fix replies dropped when flood.max.unscoped is
+low") later made the reply decision three-way rather than two-way: a reply whose
+request scope is *unknowable* (a DIRECT request carries no transport codes, or
+its code matched no Region) now falls back to the node's default scope instead
+of going out un-scoped, where repeaters running ``flood.max.unscoped=0`` drop it
+at hop 0. Un-scoped is only mirrored when the request itself arrived un-scoped.
+See ``TestReplyScopeDecision`` below.
 """
 
 from __future__ import annotations
@@ -34,6 +42,7 @@ from openhop_core.protocol import (
     LocalIdentity,
     Packet,
     PacketBuilder,
+    PathUtils,
 )
 from openhop_core.protocol.constants import (
     PAYLOAD_TYPE_ANON_REQ,
@@ -46,8 +55,10 @@ from openhop_core.protocol.constants import (
     TXT_TYPE_PLAIN,
 )
 from openhop_core.protocol.region_map import (
+    REGION_DENY_FLOOD,
     RegionEntry,
     RegionMap,
+    apply_reply_scope,
     capture_recv_region,
 )
 from openhop_core.protocol.transport_keys import (
@@ -122,7 +133,7 @@ def _build_login_req(
     return pkt
 
 
-def _login_handler(server: LocalIdentity):
+def _login_handler(server: LocalIdentity, get_client_fn=None):
     """A LoginServerHandler that always authenticates, capturing sent replies."""
     sent: list = []
     handler = LoginServerHandler(
@@ -130,6 +141,7 @@ def _login_handler(server: LocalIdentity):
         log_fn=lambda *_: None,
         authenticate_callback=lambda *a, **k: (True, 0x03),
         is_room_server=False,
+        get_client_fn=get_client_fn,
     )
     handler.set_send_packet_callback(lambda pkt, delay_ms: sent.append(pkt))
     return handler, sent
@@ -451,8 +463,11 @@ class TestRepeaterReplyCarriesRegion:
         assert reply._flood_scope_applied is True
 
     @pytest.mark.asyncio
-    async def test_unknown_region_reply_stays_plain(self):
-        """(10) A request scoped to a region absent from the map => plain reply."""
+    async def test_unknown_region_reply_takes_the_node_default(self):
+        """(10) A request scoped to a region absent from the map: the scope is
+        unknowable, so PR #3106's REPLY_SCOPE_DEFAULT applies -- the reply defers
+        to the node default rather than going out un-scoped (which a repeater
+        running flood.max.unscoped=0 would drop at hop 0)."""
         region_map, _a_key, _b_key = self._region_map()
         server, client = LocalIdentity(), LocalIdentity()
         handler, sent = _login_handler(server)
@@ -462,12 +477,21 @@ class TestRepeaterReplyCarriesRegion:
         capture_recv_region(region_map, req)
         assert req._recv_region_captured is True
         assert req._recv_region_key is None  # no region matched
+        assert req._recv_region_unscoped is False  # unknowable, not un-scoped
 
         await handler(req)
         reply = sent[0]
+        # Deferred, not decided: the build leaves it plain but unmarked.
         assert reply.get_route_type() == ROUTE_TYPE_FLOOD
-        assert reply.transport_codes == [0, 0]
-        assert reply._flood_scope_applied is True
+        assert reply._flood_scope_applied is False
+
+        # ...and the dispatcher resolves it to the default at TX time.
+        default_key = get_auto_key_for("#default-region")
+        dispatcher = Dispatcher(MockRadio())
+        dispatcher.default_flood_transport_key = default_key
+        dispatcher._apply_flood_scope(reply)
+        assert reply.get_route_type() == ROUTE_TYPE_TRANSPORT_FLOOD
+        assert reply.transport_codes[0] == calc_transport_code(default_key, reply)
 
     @pytest.mark.asyncio
     async def test_interleaved_requests_each_reply_scoped_correctly(self):
@@ -568,11 +592,13 @@ class TestRepeaterReqReplyScope:
         return pkt
 
     @pytest.mark.asyncio
-    async def test_direct_req_without_out_path_replies_plain_flood(self):
-        """Branch (b): the node default must not reach this reply.
+    async def test_direct_req_without_out_path_takes_the_node_default(self):
+        """Branch (b): a DIRECT request carries no transport codes, so firmware's
+        ``recv_pkt_region`` is NULL and the reply scope is unknowable.
 
-        A DIRECT request captures no region (firmware ``recv_pkt_region`` is
-        NULL), so the flood RESPONSE stays plain and is marked applied.
+        Pre-#3106 this flooded un-scoped, which is exactly the reported bug: any
+        repeater on the way back running ``flood.max.unscoped=0`` drops it at hop
+        0. REPLY_SCOPE_DEFAULT now sends it under the node's default Region.
         """
         region_map = RegionMap([RegionEntry(id=1, name="#region-a")])
         server, client = LocalIdentity(), LocalIdentity()
@@ -582,20 +608,21 @@ class TestRepeaterReqReplyScope:
         capture_recv_region(region_map, req)
         assert req._recv_region_captured is True
         assert req._recv_region_key is None
+        assert req._recv_region_unscoped is False
 
         result = await handler(req)
         assert result.authenticated is True
         reply = result.response
         assert reply is not None
         assert reply.get_route_type() == ROUTE_TYPE_FLOOD
-        assert reply._flood_scope_applied is True
+        assert reply._flood_scope_applied is False
 
-        # The gate has to actually hold at TX time against a configured default.
+        default_key = get_auto_key_for("#region-a")
         dispatcher = Dispatcher(MockRadio())
-        dispatcher.default_flood_transport_key = get_auto_key_for("#region-a")
+        dispatcher.default_flood_transport_key = default_key
         dispatcher._apply_flood_scope(reply)
-        assert reply.get_route_type() == ROUTE_TYPE_FLOOD
-        assert reply.transport_codes == [0, 0]
+        assert reply.get_route_type() == ROUTE_TYPE_TRANSPORT_FLOOD
+        assert reply.transport_codes[0] == calc_transport_code(default_key, reply)
 
     @pytest.mark.asyncio
     async def test_flood_req_path_return_carries_request_region(self):
@@ -734,3 +761,332 @@ class TestRegionCaptureBothEntrypoints:
 
         assert pkt._recv_region_captured is False
         assert pkt._recv_region_key is None
+
+
+# ---------------------------------------------------------------------------
+# Upstream MeshCore PR #3106 parity
+# ---------------------------------------------------------------------------
+
+
+class TestReplyScopeDecision:
+    """The three-way ``chooseReplyScope`` truth table (RoutingPolicy.h).
+
+    Exercised through ``capture_recv_region`` + ``apply_reply_scope`` + the
+    dispatcher's TX-time resolution, which together are what firmware's
+    ``sendFloodReply`` does in one call.
+    """
+
+    DEFAULT = get_auto_key_for("#default-region")
+
+    def _reply(self):
+        """A bare plain-FLOOD reply packet, as a handler would hand over."""
+        pkt = Packet()
+        pkt.header = (PAYLOAD_TYPE_PATH << 2) | ROUTE_TYPE_FLOOD
+        pkt.payload = bytearray(b"reply-payload")
+        pkt.payload_len = len(pkt.payload)
+        return pkt
+
+    def _request(self, route_type, region_key=None):
+        pkt = Packet()
+        pkt.header = (PAYLOAD_TYPE_ANON_REQ << 2) | route_type
+        pkt.payload = bytearray(b"request-payload")
+        pkt.payload_len = len(pkt.payload)
+        if region_key is not None:
+            scope_packet(pkt, region_key)
+        return pkt
+
+    def _tx(self, reply, default_key=DEFAULT, **dispatcher_state):
+        dispatcher = Dispatcher(MockRadio())
+        dispatcher.default_flood_transport_key = default_key
+        for attr, value in dispatcher_state.items():
+            setattr(dispatcher, attr, value)
+        dispatcher._apply_flood_scope(reply)
+        return reply
+
+    def test_request_scope_known_is_mirrored(self):
+        """REPLY_SCOPE_REQUEST wins over a configured default."""
+        a_key = get_auto_key_for("#region-a")
+        region_map = RegionMap([RegionEntry(id=1, name="#region-a")])
+        req = self._request(ROUTE_TYPE_TRANSPORT_FLOOD, region_key=a_key)
+        capture_recv_region(region_map, req)
+        assert req._recv_region_key == a_key
+
+        reply = self._reply()
+        apply_reply_scope(reply, req)
+        assert reply._flood_scope_applied is True
+        self._tx(reply)
+        assert reply.get_route_type() == ROUTE_TYPE_TRANSPORT_FLOOD
+        # Region A, not the default, and re-hashed over the *reply* payload.
+        assert reply.transport_codes[0] == calc_transport_code(a_key, reply)
+        assert reply.transport_codes[0] != calc_transport_code(self.DEFAULT, reply)
+
+    def test_unscoped_flood_request_is_mirrored_even_when_a_default_exists(self):
+        """REPLY_SCOPE_NONE: un-scoped is itself a known scope, so mirror it.
+
+        Upstream's reasoning: replying scoped would change a return path that
+        works today, and repeaters not holding our default Region would drop it.
+        """
+        region_map = RegionMap([RegionEntry(id=1, name="#region-a")])
+        req = self._request(ROUTE_TYPE_FLOOD)
+        capture_recv_region(region_map, req)
+        assert req._recv_region_key is None
+        assert req._recv_region_unscoped is True
+
+        reply = self._reply()
+        apply_reply_scope(reply, req)
+        assert reply._flood_scope_applied is True
+        self._tx(reply)
+        assert reply.get_route_type() == ROUTE_TYPE_FLOOD
+        assert reply.transport_codes == [0, 0]
+
+    def test_wildcard_denying_flood_makes_the_scope_unknowable(self):
+        """Firmware sets recv_pkt_region = NULL when the wildcard denies flood,
+        which is the unknowable case, not the un-scoped one."""
+        region_map = RegionMap([RegionEntry(id=1, name="#region-a")])
+        region_map.wildcard.flags = REGION_DENY_FLOOD
+        req = self._request(ROUTE_TYPE_FLOOD)
+        capture_recv_region(region_map, req)
+        assert req._recv_region_key is None
+        assert req._recv_region_unscoped is False
+
+        reply = self._reply()
+        apply_reply_scope(reply, req)
+        self._tx(reply)
+        assert reply.transport_codes[0] == calc_transport_code(self.DEFAULT, reply)
+
+    def test_direct_request_defers_to_the_default(self):
+        """REPLY_SCOPE_DEFAULT: a DIRECT request carries no transport codes."""
+        region_map = RegionMap([RegionEntry(id=1, name="#region-a")])
+        req = self._request(ROUTE_TYPE_DIRECT)
+        capture_recv_region(region_map, req)
+        assert req._recv_region_unscoped is False
+
+        reply = self._reply()
+        apply_reply_scope(reply, req)
+        assert reply._flood_scope_applied is False
+        self._tx(reply)
+        assert reply.get_route_type() == ROUTE_TYPE_TRANSPORT_FLOOD
+        assert reply.transport_codes[0] == calc_transport_code(self.DEFAULT, reply)
+
+    def test_no_default_configured_falls_back_to_unscoped(self):
+        """Firmware's final REPLY_SCOPE_NONE: no scope available at all."""
+        region_map = RegionMap([RegionEntry(id=1, name="#region-a")])
+        req = self._request(ROUTE_TYPE_DIRECT)
+        capture_recv_region(region_map, req)
+
+        reply = self._reply()
+        apply_reply_scope(reply, req)
+        self._tx(reply, default_key=None)
+        assert reply.get_route_type() == ROUTE_TYPE_FLOOD
+        assert reply.transport_codes == [0, 0]
+
+    def test_default_branch_uses_the_ordinary_send_precedence(self):
+        """The deferring branch resolves through the node's normal chain.
+
+        On a repeater that is just the persisted default (no override, no
+        send_unscoped), i.e. exactly sendFloodScoped(default_scope, ...). On a
+        companion the transient override wins first, which is what firmware's
+        sendFloodScoped(recipient) -- the overload BaseChatMesh answers this
+        same case with -- does. One mechanism, correct in both roles.
+        """
+        region_map = RegionMap([RegionEntry(id=1, name="#region-a")])
+        override = get_auto_key_for("#override-region")
+
+        req = self._request(ROUTE_TYPE_DIRECT)
+        capture_recv_region(region_map, req)
+        reply = self._reply()
+        apply_reply_scope(reply, req)
+        self._tx(reply, flood_transport_key=override)
+
+        assert reply.get_route_type() == ROUTE_TYPE_TRANSPORT_FLOOD
+        assert reply.transport_codes[0] == calc_transport_code(override, reply)
+
+    def test_explicit_unscoped_still_suppresses_the_deferred_scope(self):
+        """A node told to force un-scoped floods keeps doing so; the deferring
+        branch never overrides a decision the operator made explicitly."""
+        region_map = RegionMap([RegionEntry(id=1, name="#region-a")])
+        req = self._request(ROUTE_TYPE_DIRECT)
+        capture_recv_region(region_map, req)
+        reply = self._reply()
+        apply_reply_scope(reply, req)
+        self._tx(reply, flood_unscoped=True)
+
+        assert reply.get_route_type() == ROUTE_TYPE_FLOOD
+        assert reply.transport_codes == [0, 0]
+
+    def test_uncaptured_reply_is_left_to_the_ordinary_precedence(self):
+        """A standalone node (no RegionMap) is untouched by any of this: the
+        reply keeps falling through to the override-else-default chain."""
+        override = get_auto_key_for("#override-region")
+        reply = self._reply()
+        apply_reply_scope(reply, self._request(ROUTE_TYPE_DIRECT))  # never captured
+        assert reply._flood_scope_applied is False
+        self._tx(reply, flood_transport_key=override)
+        assert reply.transport_codes[0] == calc_transport_code(override, reply)
+
+
+class _AclClient:
+    """Stand-in for a repeater ACL entry (firmware ``ClientInfo``)."""
+
+    def __init__(self, out_path: bytes = b"", out_path_len: int = -1):
+        self.out_path = bytearray(out_path)
+        self.out_path_len = out_path_len
+
+
+class TestLoginReplyRoute:
+    """``chooseReplyRoute`` parity for ANON_REQ logins (RoutingPolicy.h).
+
+    A login never carries a supplied reply path -- firmware's ``handleLoginReq``
+    never sets ``reply_path_len`` -- so REPLY_ROUTE_DIRECT_SUPPLIED cannot arise
+    and the table reduces to: flood => PATH return, stored out_path => DIRECT,
+    otherwise => flood.
+    """
+
+    @staticmethod
+    def _two_hop_path():
+        """A 2-hop, 2-byte-hash out_path: 4 bytes, path_len 0x42."""
+        return bytes([0xA1, 0xA2, 0xB1, 0xB2]), PathUtils.encode_path_len(2, 2)
+
+    @pytest.mark.asyncio
+    async def test_direct_login_with_out_path_replies_direct(self):
+        """The reported bug: this used to be flooded, and died at hop 0 on any
+        repeater running flood.max.unscoped=0."""
+        out_path, out_path_len = self._two_hop_path()
+        client_info = _AclClient(out_path, out_path_len)
+        server, client = LocalIdentity(), LocalIdentity()
+        handler, sent = _login_handler(server, get_client_fn=lambda _pub: client_info)
+
+        req = _build_login_req(server, client, route_type=ROUTE_TYPE_DIRECT)
+        await handler(req)
+
+        assert len(sent) == 1
+        reply = sent[0]
+        assert reply.get_route_type() == ROUTE_TYPE_DIRECT
+        assert bytes(reply.path) == out_path
+        assert reply.path_len == out_path_len
+        # A sendDirect is never scoped and never routed through sendFloodReply.
+        assert reply.transport_codes == [0, 0]
+        assert reply._flood_scope_applied is False
+
+    @pytest.mark.asyncio
+    async def test_out_path_reply_keeps_its_own_hash_width(self):
+        """The stored path's width must survive: the request's width is mirrored
+        onto flood replies only, and would misdescribe these path bytes."""
+        out_path, out_path_len = self._two_hop_path()  # 2-byte hashes
+        server, client = LocalIdentity(), LocalIdentity()
+        handler, sent = _login_handler(
+            server, get_client_fn=lambda _pub: _AclClient(out_path, out_path_len)
+        )
+
+        req = _build_login_req(server, client, route_type=ROUTE_TYPE_DIRECT)
+        assert PathUtils.get_path_hash_size(req.path_len) == 1  # request is 1-byte
+        await handler(req)
+
+        reply = sent[0]
+        assert PathUtils.get_path_hash_size(reply.path_len) == 2
+        assert PathUtils.get_path_hash_count(reply.path_len) == 2
+        assert reply._path_hash_mode_applied is False
+
+    @pytest.mark.asyncio
+    async def test_direct_login_without_out_path_still_floods(self):
+        """REPLY_ROUTE_FLOOD fallback, unchanged."""
+        server, client = LocalIdentity(), LocalIdentity()
+        handler, sent = _login_handler(server, get_client_fn=lambda _pub: _AclClient())
+
+        req = _build_login_req(server, client, route_type=ROUTE_TYPE_DIRECT)
+        await handler(req)
+        assert sent[0].get_route_type() == ROUTE_TYPE_FLOOD
+
+    @pytest.mark.asyncio
+    async def test_direct_login_without_an_acl_lookup_still_floods(self):
+        """No ``get_client_fn`` wired (e.g. CompanionBridge): behaviour is
+        exactly what it was before this change."""
+        server, client = LocalIdentity(), LocalIdentity()
+        handler, sent = _login_handler(server)  # get_client_fn defaults to None
+
+        req = _build_login_req(server, client, route_type=ROUTE_TYPE_DIRECT)
+        await handler(req)
+        assert sent[0].get_route_type() == ROUTE_TYPE_FLOOD
+
+    @pytest.mark.asyncio
+    async def test_flood_login_still_gets_a_path_return(self):
+        """REPLY_ROUTE_PATH_RETURN outranks a stored out_path."""
+        out_path, out_path_len = self._two_hop_path()
+        server, client = LocalIdentity(), LocalIdentity()
+        handler, sent = _login_handler(
+            server, get_client_fn=lambda _pub: _AclClient(out_path, out_path_len)
+        )
+
+        req = _build_login_req(server, client, route_type=ROUTE_TYPE_FLOOD)
+        await handler(req)
+        assert sent[0].get_payload_type() == PAYLOAD_TYPE_PATH
+
+    @pytest.mark.asyncio
+    async def test_flood_login_clears_a_stored_out_path(self):
+        """Firmware ``handleLoginReq``: a client that reached us by flooding has
+        no trustworthy stored path any more. Without this the *next* DIRECT
+        request would be answered down a dead route."""
+        out_path, out_path_len = self._two_hop_path()
+        client_info = _AclClient(out_path, out_path_len)
+        server, client = LocalIdentity(), LocalIdentity()
+        handler, _sent = _login_handler(server, get_client_fn=lambda _pub: client_info)
+
+        await handler(_build_login_req(server, client, route_type=ROUTE_TYPE_FLOOD))
+        assert client_info.out_path_len == -1
+
+        # ...so a subsequent DIRECT login falls back to flooding, not the stale path.
+        handler2, sent2 = _login_handler(server, get_client_fn=lambda _pub: client_info)
+        await handler2(_build_login_req(server, client, route_type=ROUTE_TYPE_DIRECT))
+        assert sent2[0].get_route_type() == ROUTE_TYPE_FLOOD
+
+    @pytest.mark.asyncio
+    async def test_short_out_path_buffer_is_rejected(self):
+        """``set_path`` stores the buffer verbatim, so a path shorter than its
+        declared hop count would put uninitialised bytes on the air."""
+        _out_path, out_path_len = self._two_hop_path()  # declares 4 bytes
+        server, client = LocalIdentity(), LocalIdentity()
+        handler, sent = _login_handler(
+            server, get_client_fn=lambda _pub: _AclClient(b"\xa1", out_path_len)
+        )
+
+        await handler(_build_login_req(server, client, route_type=ROUTE_TYPE_DIRECT))
+        assert sent[0].get_route_type() == ROUTE_TYPE_FLOOD
+
+    @pytest.mark.asyncio
+    async def test_unencodable_out_path_len_is_rejected(self):
+        bad_len = PathUtils.encode_path_len(3, 63)  # 189 bytes > MAX_PATH_SIZE
+        assert PathUtils.is_valid_path_len(bad_len) is False
+        server, client = LocalIdentity(), LocalIdentity()
+        handler, sent = _login_handler(
+            server, get_client_fn=lambda _pub: _AclClient(bytes(189), bad_len)
+        )
+
+        await handler(_build_login_req(server, client, route_type=ROUTE_TYPE_DIRECT))
+        assert sent[0].get_route_type() == ROUTE_TYPE_FLOOD
+
+    @pytest.mark.asyncio
+    async def test_acl_lookup_failure_falls_back_to_flood(self):
+        """An application ACL must not be able to kill the login reply."""
+
+        def _boom(_pub):
+            raise RuntimeError("ACL exploded")
+
+        server, client = LocalIdentity(), LocalIdentity()
+        handler, sent = _login_handler(server, get_client_fn=_boom)
+
+        await handler(_build_login_req(server, client, route_type=ROUTE_TYPE_DIRECT))
+        assert len(sent) == 1
+        assert sent[0].get_route_type() == ROUTE_TYPE_FLOOD
+
+    @pytest.mark.asyncio
+    async def test_acl_is_looked_up_by_full_public_key(self):
+        """Firmware ``acl.getClient(sender.pub_key, PUB_KEY_SIZE)`` -- not the
+        one-byte hash ProtocolRequestHandler's lookup takes."""
+        seen: list = []
+        server, client = LocalIdentity(), LocalIdentity()
+        handler, _sent = _login_handler(
+            server, get_client_fn=lambda pub: seen.append(pub) or _AclClient()
+        )
+
+        await handler(_build_login_req(server, client, route_type=ROUTE_TYPE_DIRECT))
+        assert seen == [client.get_public_key()]
