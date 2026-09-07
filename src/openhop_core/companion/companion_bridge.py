@@ -191,10 +191,14 @@ class CompanionBridge(CompanionBase):
         initial_contacts: Optional[Iterable[Any]] = None,
         radio_settings_getter: Optional[Callable[[], Mapping[str, Any]]] = None,
         max_tx_power_getter: Optional[Callable[[], Optional[int]]] = None,
+        enabled: bool = True,
     ) -> None:
         """Initialise the companion bridge."""
         self._radio_settings_getter = radio_settings_getter
         self._max_tx_power_getter = max_tx_power_getter
+        # A disabled bridge keeps every store and preference it was built with
+        # but stays off the air entirely.  See :meth:`set_enabled`.
+        self._enabled = bool(enabled)
         self._init_companion_stores(
             identity=identity,
             node_name=node_name,
@@ -215,12 +219,12 @@ class CompanionBridge(CompanionBase):
         self.region_map: Optional[RegionMap] = None
 
         async def _handler_send_packet(pkt: Packet, wait_for_ack: bool = False) -> bool:
-            return await self._packet_injector(pkt, wait_for_ack=wait_for_ack)
+            return await self._inject(pkt, wait_for_ack=wait_for_ack)
 
         def _login_send_callback(pkt: Packet, delay_ms: int) -> None:
             async def _delayed_send() -> None:
                 await asyncio.sleep(delay_ms / 1000.0)
-                await self._packet_injector(pkt, wait_for_ack=False)
+                await self._inject(pkt, wait_for_ack=False)
 
             self._spawn_background_task(_delayed_send(), "login delayed send")
 
@@ -289,10 +293,29 @@ class CompanionBridge(CompanionBase):
         # status/telemetry/neighbours reply from the same contact.
         core.login_response_handler.set_foreign_request_probe(self.has_pending_request_tag)
         core.protocol_response_handler.set_binary_response_callback(self._on_binary_response)
-        core.protocol_response_handler.set_packet_injector(self._packet_injector)
+        core.protocol_response_handler.set_packet_injector(self._inject)
         core.protocol_response_handler.set_contact_path_updated_callback(
             self._on_contact_path_updated
         )
+
+    # -------------------------------------------------------------------------
+    # TX Entry Point
+    # -------------------------------------------------------------------------
+
+    async def _inject(self, pkt: Packet, **kwargs: Any) -> bool:
+        """Hand a packet to the host injector unless this companion is disabled.
+
+        Every transmit the bridge can start funnels through here — handler
+        replies, delayed login sends, reciprocal PATHs and return-path teaches —
+        so :meth:`set_enabled` has one place to stop them.  It has to be the
+        transmit side and not just the receive side: an ACK is scheduled on a
+        delay (firmware sendAckTo's TXT_ACK_DELAY), so a DM that arrived just
+        before the toggle would otherwise still ACK from a disabled companion.
+        """
+        if not self._enabled:
+            logger.debug("Companion disabled: dropping outbound packet")
+            return False
+        return await self._packet_injector(pkt, **kwargs)
 
     # -------------------------------------------------------------------------
     # Pre-dedup flood-copy feed (host-wired)
@@ -316,6 +339,8 @@ class CompanionBridge(CompanionBase):
 
         Best-effort and never raises: this runs on the host's hot RX path.
         """
+        if not self._enabled:
+            return
         teacher = getattr(self._protocol_response_handler, "return_path_teacher", None)
         if teacher is None:
             return
@@ -467,7 +492,18 @@ class CompanionBridge(CompanionBase):
         authenticated HandlerResult, including PATH and RESPONSE handlers.
         Broadcast-style handlers (advert, ack, group) remain non-authoritative
         for the caller's forwarding decision.
+
+        A disabled companion (see :meth:`set_enabled`) claims nothing: it returns
+        a not-for-us result before any handler, counter or region capture runs.
         """
+        if not self._enabled:
+            # not_for_us() rather than consumed() is load-bearing: on a one-byte
+            # dest-hash collision the packet may belong to a co-hosted identity,
+            # and the caller must stay free to forward it.  Returning before the
+            # handlers is what keeps a disabled companion from ACKing a DM or
+            # pushing it onto the offline queue.
+            return HandlerResult.not_for_us()
+
         ptype = packet.get_payload_type()
         route_type = packet.get_route_type()
         is_flood = route_type in (ROUTE_TYPE_FLOOD, ROUTE_TYPE_TRANSPORT_FLOOD)
@@ -510,10 +546,8 @@ class CompanionBridge(CompanionBase):
     ) -> bool:
         """Send a packet via the packet_injector."""
         if expected_crc is None:
-            return await self._packet_injector(pkt, wait_for_ack=wait_for_ack)
-        return await self._packet_injector(
-            pkt, wait_for_ack=wait_for_ack, expected_crc=expected_crc
-        )
+            return await self._inject(pkt, wait_for_ack=wait_for_ack)
+        return await self._inject(pkt, wait_for_ack=wait_for_ack, expected_crc=expected_crc)
 
     # -------------------------------------------------------------------------
     # Lifecycle
@@ -540,6 +574,42 @@ class CompanionBridge(CompanionBase):
     @property
     def is_running(self) -> bool:
         return self._running
+
+    @property
+    def enabled(self) -> bool:
+        """Return whether this companion currently participates in the mesh."""
+        return self._enabled
+
+    async def set_enabled(self, enabled: bool) -> None:
+        """Enable or disable this companion, retaining its stores either way.
+
+        Disabling drops the bridge off the air: :meth:`process_received_packet`
+        claims nothing, :meth:`_send_packet` refuses, and the offline queue is
+        emptied so a disabled companion holds no messages.  Contacts, channels
+        and prefs are left alone, so re-enabling resumes on the same identity
+        with the same settings.  Work already in flight when the toggle lands
+        (frame logins, reciprocal sends) is cancelled the way :meth:`stop`
+        cancels it.
+
+        Separate from :attr:`is_running`, which tracks the lifecycle: a host may
+        never call :meth:`start` at all, and disabling is a policy the owner sets
+        rather than a shutdown.
+        """
+        enabled = bool(enabled)
+        if enabled == self._enabled:
+            return
+        self._enabled = enabled
+        if enabled:
+            logger.info("CompanionBridge enabled: name=%s", self.prefs.node_name)
+            return
+
+        self.message_queue.clear()
+        self._clear_pending_frame_logins()
+        protocol_handler = self._get_protocol_response_handler()
+        if protocol_handler is not None:
+            protocol_handler.cancel_pending_reciprocals()
+            await protocol_handler.wait_for_pending_reciprocals()
+        logger.info("CompanionBridge disabled: name=%s", self.prefs.node_name)
 
     # -------------------------------------------------------------------------
     # Key Management
