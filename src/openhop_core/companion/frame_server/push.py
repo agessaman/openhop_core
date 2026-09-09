@@ -35,9 +35,8 @@ class _PushMixin:
 
     def _setup_push_callbacks(self) -> None:
         """Subscribe to bridge events and send PUSH frames to connected client."""
-        # Clear any callbacks registered by a previous connection so they
-        # don't accumulate across reconnections.
-        self.bridge.clear_push_callbacks()
+        # Re-register this server idempotently; the bridge also belongs to SSE
+        # and persistence subscribers that must survive client reconnections.
         self.bridge.on_message_event(self._on_message_event)
         self.bridge.on_channel_message_event(self._on_channel_message_event)
         self.bridge.on_channel_data_event(self._on_channel_data_event)

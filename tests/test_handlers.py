@@ -2762,6 +2762,26 @@ class TestLoginServerHandler:
         return plaintext[2:15]
 
     @pytest.mark.asyncio
+    async def test_login_reply_uses_shared_unique_clock(self, monkeypatch):
+        from openhop_core.protocol import PacketBuilder
+
+        monkeypatch.setattr(PacketBuilder, "_last_unique_timestamp", 0)
+        now = [1700000000]
+        monkeypatch.setattr("openhop_core.protocol.packet_builder.time.time", lambda: now[0])
+        first = await self._login_reply_for(PERM_ACL_GUEST)
+        assert int.from_bytes(first[:4], "little") == now[0]
+        # Outbound requests and server replies must consume the same RTC sequence.
+        assert PacketBuilder._get_timestamp() == now[0] + 1
+        second = await self._login_reply_for(PERM_ACL_GUEST)
+        assert int.from_bytes(second[:4], "little") == now[0] + 2
+        now[0] -= 10
+        backwards = await self._login_reply_for(PERM_ACL_GUEST)
+        assert int.from_bytes(backwards[:4], "little") == 1700000003
+        now[0] = 1700000010
+        advanced = await self._login_reply_for(PERM_ACL_GUEST)
+        assert int.from_bytes(advanced[:4], "little") == now[0]
+
+    @pytest.mark.asyncio
     async def test_guest_permissions_is_admin_zero(self):
         """Guest login (role 0) → is_admin = 0 in response (matches C++ isAdmin())."""
         login_reply = await self._login_reply_for(PERM_ACL_GUEST)

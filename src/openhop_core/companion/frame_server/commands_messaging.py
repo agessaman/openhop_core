@@ -3,9 +3,10 @@ login/status/telemetry, binary/anon/control/trace/raw requests."""
 
 import asyncio
 import logging
+import math
 import struct
 
-from ...protocol.cayenne_lpp import TELEM_CHANNEL_SELF, encode_voltage
+from ...protocol.cayenne_lpp import TELEM_CHANNEL_SELF, encode_temperature, encode_voltage
 from ...protocol.constants import TELEM_PERM_BASE, TELEM_PERM_ENVIRONMENT, TELEM_PERM_LOCATION
 from ...protocol.packet_utils import PathUtils
 from ..constants import (
@@ -562,7 +563,8 @@ class _MessagingCommandsMixin:
         Mirrors the firmware 'self' telemetry request (MyMesh.cpp:1642-1656):
         it seeds a CayenneLPP buffer with a battery-voltage entry
         (`telemetry.addVoltage(TELEM_CHANNEL_SELF, battMilliVolts/1000)`),
-        appends any local sensor LPP bytes (`sensors.querySensors(0xFF, ...)`),
+        appends optional MCU temperature, then local sensor LPP bytes
+        (`sensors.querySensors(0xFF, ...)`),
         and writes a single push frame
         `[PUSH_CODE_TELEMETRY_RESPONSE][0x00][self pubkey[0:6]][CayenneLPP]`.
         The push is always emitted, even with no sensors (voltage-only floor),
@@ -570,6 +572,9 @@ class _MessagingCommandsMixin:
         """
         millivolts = self._get_batt_and_storage()[0]
         lpp = _encode_lpp_voltage(TELEM_CHANNEL_SELF, millivolts)
+        temperature = self._get_mcu_temperature_c()
+        if temperature is not None and math.isfinite(temperature):
+            lpp += encode_temperature(TELEM_CHANNEL_SELF, temperature)
         lpp += self._get_self_telemetry_lpp()
         pubkey_prefix = self.bridge.get_public_key()[:6]
         self._write_frame(bytes([PUSH_CODE_TELEMETRY_RESPONSE, 0]) + pubkey_prefix + lpp)

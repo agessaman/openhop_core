@@ -121,6 +121,18 @@ class PacketBuilder:
             return t
 
     @staticmethod
+    def get_unique_timestamp() -> int:
+        """Share the firmware RTC sequence with server response builders."""
+        return PacketBuilder._get_timestamp()
+
+    @staticmethod
+    def _validate_encrypted_length(plaintext: bytes, overhead: int) -> None:
+        # Mesh::create{,Anon,Group}Datagram reserve a worst-case AES padding tail.
+        # Preserve their preflight formulas even when the encrypted bytes would fit.
+        if len(plaintext) + overhead + CIPHER_BLOCK_SIZE - 1 > MAX_PACKET_PAYLOAD:
+            raise ValueError("plaintext exceeds firmware encrypted datagram limit")
+
+    @staticmethod
     def _calc_shared_secret_and_key(
         contact: Any, local_identity: LocalIdentity
     ) -> tuple[bytes, bytes]:
@@ -147,6 +159,7 @@ class PacketBuilder:
         contact: Any, local_identity: LocalIdentity, plaintext: bytes
     ) -> tuple[bytes, bytes, bytes]:
         """Create encrypted payload for contact-based packets with authentication."""
+        PacketBuilder._validate_encrypted_length(plaintext, 2)
         shared_secret, aes_key = PacketBuilder._calc_shared_secret_and_key(contact, local_identity)
         encrypted = PacketBuilder._encrypt_payload(aes_key, shared_secret, plaintext)
         payload = (
@@ -177,16 +190,13 @@ class PacketBuilder:
         buf = bytearray()
 
         # Set flags based on what data is provided
-        final_flags = flags
+        final_flags = flags & ~ADVERT_FLAG_HAS_NAME
         if lat != 0.0 or lon != 0.0:
             final_flags |= ADVERT_FLAG_HAS_LOCATION
         if feature1 != 0:
             final_flags |= ADVERT_FLAG_HAS_FEATURE1
         if feature2 != 0:
             final_flags |= ADVERT_FLAG_HAS_FEATURE2
-        if name:
-            final_flags |= ADVERT_FLAG_HAS_NAME
-
         buf.append(final_flags)
 
         # Add location data if present
@@ -203,12 +213,13 @@ class PacketBuilder:
         if final_flags & ADVERT_FLAG_HAS_FEATURE2:
             buf += struct.pack("<H", feature2)
 
-        # Add name if present
-        if final_flags & ADVERT_FLAG_HAS_NAME:
-            name_bytes = name.encode("utf-8")
-            # Copy name bytes up to remaining space in MAX_ADVERT_DATA_SIZE
-            remaining = MAX_ADVERT_DATA_SIZE - len(buf)
-            buf += name_bytes[:remaining]
+        # AdvertDataBuilder copies a valid UTF-8 prefix, stopping at C-string NUL.
+        remaining = MAX_ADVERT_DATA_SIZE - len(buf)
+        name_bytes = (name or "").split("\x00", 1)[0].encode("utf-8")[:remaining]
+        name_bytes = name_bytes.decode("utf-8", errors="ignore").encode("utf-8")
+        if name_bytes:
+            buf[0] |= ADVERT_FLAG_HAS_NAME
+            buf += name_bytes
 
         return bytes(buf)
 
@@ -529,6 +540,7 @@ class PacketBuilder:
         if ptype not in (PAYLOAD_TYPE_TXT_MSG, PAYLOAD_TYPE_REQ, PAYLOAD_TYPE_RESPONSE):
             raise ValueError("invalid payload type")
 
+        PacketBuilder._validate_encrypted_length(plaintext, 2)
         aes_key = secret[:16]
         cipher = PacketBuilder._encrypt_payload(aes_key, secret, plaintext)
         payload = PacketBuilder._hash_bytes(dest.get_public_key(), local_identity) + cipher
@@ -563,6 +575,7 @@ class PacketBuilder:
         Returns:
             Packet: Anonymous request packet with encryption.
         """
+        PacketBuilder._validate_encrypted_length(plaintext, 1 + 32)
         header = PacketBuilder._create_header(PAYLOAD_TYPE_ANON_REQ, route_type)
 
         dest_hash = PacketBuilder._hash_byte(dest.get_public_key())
@@ -607,6 +620,7 @@ class PacketBuilder:
 
         plaintext = PacketBuilder._pack_timestamp_data(timestamp, req_data)
 
+        PacketBuilder._validate_encrypted_length(plaintext, 1 + 32)
         contact_pubkey = bytes.fromhex(contact.public_key)
         shared_secret, aes_key = PacketBuilder._calc_shared_secret_and_key(contact, local_identity)
         cipher = PacketBuilder._encrypt_payload(aes_key, shared_secret, plaintext)
@@ -778,6 +792,7 @@ class PacketBuilder:
         content = prefix + text_bytes
         plaintext = PacketBuilder._pack_timestamp_data(timestamp, flags, content)
 
+        PacketBuilder._validate_encrypted_length(plaintext, 1)
         ciphertext = CryptoUtils._aes_encrypt(secret_bytes[:16], plaintext)
         mac = CryptoUtils._hmac_sha256(secret_bytes, ciphertext)[:2]
         payload = bytearray([channel_hash]) + mac + ciphertext
@@ -815,6 +830,7 @@ class PacketBuilder:
         if ptype not in (PAYLOAD_TYPE_GRP_TXT, PAYLOAD_TYPE_GRP_DATA):
             raise ValueError("invalid payload type")
 
+        PacketBuilder._validate_encrypted_length(plaintext, 1)
         aes_key = secret[:16]
         cipher = PacketBuilder._encrypt_payload(aes_key, secret, plaintext)
         payload = bytearray([channel_hash]) + cipher

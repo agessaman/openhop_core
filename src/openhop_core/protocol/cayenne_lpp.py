@@ -89,3 +89,12 @@ def encode_relative_humidity(channel: int, percent: float) -> bytes:
 def encode_barometric_pressure(channel: int, hpa: float) -> bytes:
     """Encode a barometric-pressure entry (LPP_BAROMETRIC_PRESSURE, 0.1 hPa/LSB)."""
     return _add_field(channel, LPP_BAROMETRIC_PRESSURE, hpa)
+
+
+def encode_gps(channel: int, latitude: float, longitude: float, altitude: float) -> bytes:
+    """Match CayenneLPP::addGPS: signed 24-bit coordinates, big endian."""
+    out = bytearray([channel & 0xFF, 0x88])
+    for value, multiplier in ((latitude, 10000), (longitude, 10000), (altitude, 100)):
+        scaled = int(_f32(_f32(value) * multiplier))
+        out.extend((scaled & 0xFFFFFF).to_bytes(3, "big"))
+    return bytes(out)

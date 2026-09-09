@@ -5,6 +5,7 @@ from __future__ import annotations
 import asyncio
 import hashlib
 import logging
+import os
 import random
 import struct
 import time
@@ -1411,7 +1412,9 @@ class _SendOpsMixin:
                     contact=proxy,
                     local_identity=self._identity,
                     protocol_code=protocol_code,
-                    data=data,
+                    # BaseChatMesh's fixed request: four reserved bytes + RNG tail.
+                    # Generate entropy on each retry; filtered telemetry uses byte 0.
+                    data=data.ljust(4, b"\x00") + os.urandom(4),
                 )
 
             started = await self._start_request(

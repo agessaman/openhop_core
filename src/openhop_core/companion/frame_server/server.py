@@ -258,6 +258,10 @@ class CompanionFrameServer(
         """Hook: return (millivolts, used_kb, total_kb).  Default: all zeros."""
         return (0, 0, 0)
 
+    def _get_mcu_temperature_c(self) -> Optional[float]:
+        """Return a platform MCU temperature, or None when unsupported."""
+        return None
+
     def _get_self_telemetry_lpp(self) -> bytes:
         """Hook: return local sensor telemetry as CayenneLPP bytes.
 

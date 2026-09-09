@@ -12,7 +12,6 @@ See examples/login_server.py for a complete implementation.
 
 import random
 import struct
-import time
 from typing import Callable, Optional
 
 from ...protocol import CryptoUtils, Identity, Packet, PacketBuilder, PathUtils
@@ -303,7 +302,7 @@ class LoginServerHandler(BaseHandler):
             # timestamp(4) + response_code(1) + keep_alive(1) + is_admin(1) +
             # permissions(1) + random(4) + firmware_ver(1)
             reply_data = bytearray(13)
-            current_time = int(time.time())
+            current_time = PacketBuilder.get_unique_timestamp()
 
             struct.pack_into("<I", reply_data, 0, current_time)  # timestamp
             reply_data[4] = response_code  # response code

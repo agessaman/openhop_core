@@ -21,25 +21,39 @@ class _CallbackMixin:
     # -------------------------------------------------------------------------
 
     def clear_push_callbacks(self) -> None:
-        """Remove all registered push callbacks.
-
-        Called by FrameServer between client connections so that stale
-        closures from a previous connection are not invoked on the next one.
-        """
+        """Explicitly remove every subscriber, including frame servers and SSE."""
         for key in self._push_callbacks:
             self._push_callbacks[key].clear()
 
+    def _register_push_callback(self, event_name: str, callback: Callable) -> None:
+        # Bound methods compare equal across attribute reads on the same owner.
+        callbacks = self._push_callbacks[event_name]
+        if callback not in callbacks:
+            callbacks.append(callback)
+
+    def _register_legacy_callback(
+        self, event_name: str, callback: Callable, adapter: Callable
+    ) -> None:
+        callbacks = self._push_callbacks[event_name]
+        for registered in callbacks:
+            if getattr(registered, "_companion_legacy_callback", None) == callback:
+                return
+        # Keep the original callable with its adapter so an explicit full clear
+        # also removes deduplication state and allows later re-registration.
+        setattr(adapter, "_companion_legacy_callback", callback)
+        callbacks.append(adapter)
+
     def on_message_event(self, callback: Callable) -> None:
         """Register a direct-message callback receiving one ``MessageEvent``."""
-        self._push_callbacks["message_event"].append(callback)
+        self._register_push_callback("message_event", callback)
 
     def on_channel_message_event(self, callback: Callable) -> None:
         """Register a channel-text callback receiving one ``ChannelMessageEvent``."""
-        self._push_callbacks["channel_message_event"].append(callback)
+        self._register_push_callback("channel_message_event", callback)
 
     def on_channel_data_event(self, callback: Callable) -> None:
         """Register a channel-data callback receiving one ``ChannelDataEvent``."""
-        self._push_callbacks["channel_data_event"].append(callback)
+        self._register_push_callback("channel_data_event", callback)
 
     @staticmethod
     async def _call_legacy(callback: Callable, *args: Any) -> None:
@@ -71,7 +85,7 @@ class _CallbackMixin:
                 event.queued,
             )
 
-        self._push_callbacks["message_event"].append(_legacy_adapter)
+        self._register_legacy_callback("message_event", callback, _legacy_adapter)
 
     def on_channel_message_received(self, callback: Callable) -> None:
         """Deprecated: prefer :meth:`on_channel_message_event`.
@@ -95,7 +109,7 @@ class _CallbackMixin:
                 event.queued,
             )
 
-        self._push_callbacks["channel_message_event"].append(_legacy_adapter)
+        self._register_legacy_callback("channel_message_event", callback, _legacy_adapter)
 
     def on_channel_data_received(self, callback: Callable) -> None:
         """Deprecated: prefer :meth:`on_channel_data_event`.
@@ -117,13 +131,13 @@ class _CallbackMixin:
                 event.queued,
             )
 
-        self._push_callbacks["channel_data_event"].append(_legacy_adapter)
+        self._register_legacy_callback("channel_data_event", callback, _legacy_adapter)
 
     def on_advert_received(self, callback: Callable) -> None:
-        self._push_callbacks["advert_received"].append(callback)
+        self._register_push_callback("advert_received", callback)
 
     def on_contact_path_updated(self, callback: Callable) -> None:
-        self._push_callbacks["contact_path_updated"].append(callback)
+        self._register_push_callback("contact_path_updated", callback)
 
     async def _on_contact_path_updated(self, pub: bytes, path_len: int, path_bytes: bytes) -> None:
         """Called by ProtocolResponseHandler when contact's out_path is updated from a PATH packet.
@@ -151,25 +165,25 @@ class _CallbackMixin:
         await self._fire_callbacks("contact_path_updated", contact)
 
     def on_send_confirmed(self, callback: Callable) -> None:
-        self._push_callbacks["send_confirmed"].append(callback)
+        self._register_push_callback("send_confirmed", callback)
 
     def on_trace_received(self, callback: Callable) -> None:
-        self._push_callbacks["trace_received"].append(callback)
+        self._register_push_callback("trace_received", callback)
 
     def on_node_discovered(self, callback: Callable) -> None:
-        self._push_callbacks["node_discovered"].append(callback)
+        self._register_push_callback("node_discovered", callback)
 
     def on_login_result(self, callback: Callable) -> None:
-        self._push_callbacks["login_result"].append(callback)
+        self._register_push_callback("login_result", callback)
 
     def on_telemetry_response(self, callback: Callable) -> None:
-        self._push_callbacks["telemetry_response"].append(callback)
+        self._register_push_callback("telemetry_response", callback)
 
     def on_status_response(self, callback: Callable) -> None:
-        self._push_callbacks["status_response"].append(callback)
+        self._register_push_callback("status_response", callback)
 
     def on_raw_data_received(self, callback: Callable) -> None:
-        self._push_callbacks["raw_data_received"].append(callback)
+        self._register_push_callback("raw_data_received", callback)
 
     def on_rx_log_data(self, callback: Callable) -> None:
         """Register callback for raw RX with SNR/RSSI (CompanionRadio only).
@@ -178,27 +192,27 @@ class _CallbackMixin:
         PUSH_CODE_LOG_RX_DATA (0x88). Only fired when using CompanionRadio;
         CompanionBridge does not own the radio.
         """
-        self._push_callbacks["rx_log_data"].append(callback)
+        self._register_push_callback("rx_log_data", callback)
 
     def on_binary_response(self, callback: Callable) -> None:
         """Register callback for PUSH 0x8C. Callback(tag_bytes, response_data)."""
-        self._push_callbacks["binary_response"].append(callback)
+        self._register_push_callback("binary_response", callback)
 
     def on_path_discovery_response(self, callback: Callable) -> None:
         """Register callback for path discovery 0x8D. (tag_bytes, pubkey, out_path, in_path)."""
-        self._push_callbacks["path_discovery_response"].append(callback)
+        self._register_push_callback("path_discovery_response", callback)
 
     def on_contact_deleted(self, callback: Callable) -> None:
         """Register callback for PUSH 0x8F (contact overwritten). Callback(pub_key_bytes)."""
-        self._push_callbacks["contact_deleted"].append(callback)
+        self._register_push_callback("contact_deleted", callback)
 
     def on_contacts_full(self, callback: Callable) -> None:
         """Register callback for PUSH 0x90 (contacts store full). Callback()."""
-        self._push_callbacks["contacts_full"].append(callback)
+        self._register_push_callback("contacts_full", callback)
 
     def on_channel_updated(self, callback: Callable) -> None:
         """Register callback for channel set/remove. Callback(idx: int, channel_or_none)."""
-        self._push_callbacks["channel_updated"].append(callback)
+        self._register_push_callback("channel_updated", callback)
 
     def register_binary_request(
         self,
