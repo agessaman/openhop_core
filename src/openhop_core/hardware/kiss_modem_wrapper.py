@@ -102,6 +102,12 @@ HW_CMD_PING = 0x17
 HW_CMD_REBOOT = 0x18
 HW_CMD_SET_SIGNAL_REPORT = 0x19
 HW_CMD_GET_SIGNAL_REPORT = 0x1A
+# Protocol v2 (KISS_FIRMWARE_VERSION 2). Older firmware answers these with UNKNOWN_CMD.
+HW_CMD_GET_CAPABILITIES = 0x1B
+HW_CMD_SET_AGC_RESET_INTERVAL = 0x1C
+HW_CMD_GET_AGC_RESET_INTERVAL = 0x1D
+HW_CMD_SET_FEM_STATE = 0x1E
+HW_CMD_GET_FEM_STATE = 0x1F
 
 # SetHardware response sub-commands (TNC -> Host)
 # Spec: response = command | 0x80 for command responses; 0xF0+ for generic/unsolicited
@@ -131,6 +137,25 @@ HW_RESP_ERROR = 0xF1
 HW_RESP_TX_DONE = 0xF8  # Unsolicited
 HW_RESP_RX_META = 0xF9  # Unsolicited
 HW_RESP_SIGNAL_REPORT = 0x9A  # HW_CMD_GET_SIGNAL_REPORT | 0x80
+HW_RESP_CAPABILITIES = 0x9B  # HW_CMD_GET_CAPABILITIES | 0x80
+# SET_AGC_RESET_INTERVAL and SET_FEM_STATE reply with these GET-form codes; 0x9C and
+# 0x9E are never sent.
+HW_RESP_AGC_RESET_INTERVAL = 0x9D  # HW_CMD_GET_AGC_RESET_INTERVAL | 0x80
+HW_RESP_FEM_STATE = 0x9F  # HW_CMD_GET_FEM_STATE | 0x80
+
+# GetCapabilities feature bits (uint32 LE). Probe these rather than inferring from the
+# firmware version: boards on the same version expose different hardware controls.
+HW_CAP_AGC_RESET = 1 << 0
+HW_CAP_FEM_RX_GAIN = 1 << 1
+HW_CAP_FEM_TX_GAIN = 1 << 2
+
+# SetFemState / FemState bit masks
+HW_FEM_RX_GAIN = 1 << 0  # external LNA enabled
+HW_FEM_TX_GAIN = 1 << 1  # external PA high gain enabled
+
+# AGC reset interval: 0 disables; firmware rounds down to a multiple of 4 s.
+AGC_RESET_INTERVAL_MAX_SEC = 1020
+AGC_RESET_INTERVAL_STEP_SEC = 4
 
 # Backward-compatible aliases (same values as HW_*)
 CMD_GET_IDENTITY = HW_CMD_GET_IDENTITY
@@ -193,6 +218,8 @@ HW_ERR_ENCRYPT_FAILED = 0x06
 # so TX_BUSY is never a verdict on the in-flight frame; only TX_DONE is, and firmware
 # retains a TX_DONE until it can be queued rather than dropping it.
 HW_ERR_TX_BUSY = 0x07
+# Command known, but this board cannot do it (e.g. FEM gain on a board without one).
+HW_ERR_UNSUPPORTED = 0x08
 
 ERR_INVALID_LENGTH = HW_ERR_INVALID_LENGTH
 ERR_INVALID_PARAM = HW_ERR_INVALID_PARAM
@@ -201,6 +228,7 @@ ERR_MAC_FAILED = HW_ERR_MAC_FAILED
 ERR_UNKNOWN_CMD = HW_ERR_UNKNOWN_CMD
 ERR_ENCRYPT_FAILED = HW_ERR_ENCRYPT_FAILED
 ERR_TX_BUSY = HW_ERR_TX_BUSY
+ERR_UNSUPPORTED = HW_ERR_UNSUPPORTED
 
 # Buffer and timing constants
 MAX_FRAME_SIZE = 512
@@ -266,9 +294,11 @@ class KissModemWrapper(LoRaRadio):
 
     # Some SetHardware setters answer with the GET-form response code rather than
     # the setter's own command|0x80. SET_SIGNAL_REPORT (0x19) replies with
-    # HW_RESP(HW_CMD_GET_SIGNAL_REPORT) = 0x9A.
+    # HW_RESP(HW_CMD_GET_SIGNAL_REPORT) = 0x9A; the v2 setters follow suit.
     _SETHW_EXTRA_ACCEPT_RESP: dict[int, int] = {
         HW_CMD_SET_SIGNAL_REPORT: HW_RESP_SIGNAL_REPORT,
+        HW_CMD_SET_AGC_RESET_INTERVAL: HW_RESP_AGC_RESET_INTERVAL,
+        HW_CMD_SET_FEM_STATE: HW_RESP_FEM_STATE,
     }
 
     def __init__(
@@ -299,7 +329,11 @@ class KissModemWrapper(LoRaRadio):
                          power (or tx_power), tx_delay_ms (KISS key-up delay in ms;
                          default 50), kiss_persistence (0-255), kiss_slottime_ms,
                          kiss_txtail_ms (post-TX hold), kiss_full_duplex (bool),
-                         and SetHardware options as needed
+                         agc_reset_interval_seconds (0-1020, 0 disables),
+                         fem_rx_gain (bool), fem_tx_gain (bool), and SetHardware
+                         options as needed. The AGC/FEM keys are optional: when
+                         absent the modem keeps its firmware/board default. They
+                         are re-applied after every reconnect.
             auto_configure: If True, automatically configure radio on connect
             lbt_enabled: If True, run Listen-Before-Talk before each send (default False).
                          For standard half-duplex the modem firmware performs p-persistent
@@ -461,6 +495,8 @@ class KissModemWrapper(LoRaRadio):
         # Modem info
         self.modem_version: Optional[int] = None
         self.modem_identity: Optional[bytes] = None
+        # GetCapabilities feature bits; None until probed, 0 on pre-v2 firmware.
+        self.modem_capabilities: Optional[int] = None
 
     def set_event_loop(self, loop: asyncio.AbstractEventLoop) -> None:
         """
@@ -755,7 +791,59 @@ class KissModemWrapper(LoRaRadio):
             self.set_kiss_txtail(self.radio_config["kiss_txtail_ms"])
         if "kiss_full_duplex" in self.radio_config:
             self.set_kiss_full_duplex(bool(self.radio_config["kiss_full_duplex"]))
+        self._apply_optional_hardware_config()
         return True
+
+    def _apply_optional_hardware_config(self) -> None:
+        """Push configured AGC/FEM settings to the modem.
+
+        Only keys present in radio_config are sent. A setting the modem cannot apply
+        is logged, never fatal: front-end tuning must not take a working link down.
+        """
+        cfg = self.radio_config
+        agc = cfg.get("agc_reset_interval_seconds")
+        if agc is not None:
+            if not self.supports_agc_reset_control():
+                logger.warning(
+                    "Configured AGC reset interval (%ss) cannot be applied: "
+                    "modem firmware does not support it",
+                    agc,
+                )
+            else:
+                try:
+                    effective = self.set_agc_reset_interval(int(agc))
+                except (TypeError, ValueError) as e:
+                    logger.warning("Invalid agc_reset_interval_seconds %r: %s", agc, e)
+                else:
+                    if effective is None:
+                        logger.warning("Failed to apply AGC reset interval %ss", agc)
+                    else:
+                        logger.info("Modem AGC reset interval set to %ds", effective)
+
+        rx_gain = cfg.get("fem_rx_gain")
+        tx_gain = cfg.get("fem_tx_gain")
+        # SetFemState is all-or-nothing, so drop unsupported bits rather than letting
+        # one of them block the other.
+        if rx_gain is not None and not self.supports_fem_rx_gain():
+            logger.warning(
+                "Configured FEM RX gain cannot be applied: modem reports feature unsupported"
+            )
+            rx_gain = None
+        if tx_gain is not None and not self.supports_fem_tx_gain():
+            logger.warning(
+                "Configured FEM TX gain cannot be applied: modem reports feature unsupported"
+            )
+            tx_gain = None
+        if rx_gain is not None or tx_gain is not None:
+            state = self.set_fem_state(rx_gain=rx_gain, tx_gain=tx_gain)
+            if state is None:
+                logger.warning("Failed to apply FEM state (rx=%s, tx=%s)", rx_gain, tx_gain)
+            else:
+                logger.info(
+                    "Modem FEM state: rx_gain=%s tx_gain=%s",
+                    state["rx_gain"],
+                    state["tx_gain"],
+                )
 
     def _close_serial_connection(self) -> None:
         """Close serial handle without waiting for worker threads."""
@@ -1138,8 +1226,132 @@ class KissModemWrapper(LoRaRadio):
             return resp[1][0] != 0x00
         return None
 
+    def get_hardware_capabilities(self, refresh: bool = False) -> int:
+        """Return the modem's GetCapabilities feature bits (HW_CAP_*).
+
+        Cached from the connect handshake; ``refresh`` re-probes. Firmware that
+        predates the command answers UNKNOWN_CMD and reports 0. A probe that gets no
+        answer also reports 0 but leaves the cache unset so a later call retries.
+        """
+        if self.modem_capabilities is not None and not refresh:
+            return self.modem_capabilities
+        resp = self._send_command(HW_CMD_GET_CAPABILITIES)
+        if resp and resp[0] == HW_RESP_CAPABILITIES and len(resp[1]) >= 4:
+            self.modem_capabilities = struct.unpack("<I", resp[1][:4])[0]
+        elif resp and resp[0] == HW_RESP_ERROR:
+            self.modem_capabilities = 0
+        else:
+            return 0
+        return self.modem_capabilities
+
+    def supports_agc_reset_control(self) -> bool:
+        return bool(self.get_hardware_capabilities() & HW_CAP_AGC_RESET)
+
+    def supports_fem_rx_gain(self) -> bool:
+        return bool(self.get_hardware_capabilities() & HW_CAP_FEM_RX_GAIN)
+
+    def supports_fem_tx_gain(self) -> bool:
+        return bool(self.get_hardware_capabilities() & HW_CAP_FEM_TX_GAIN)
+
+    def set_agc_reset_interval(self, seconds: int) -> Optional[int]:
+        """Set the modem's periodic AGC reset interval.
+
+        Args:
+            seconds: 0-1020; 0 disables. The modem rounds down to a multiple of 4,
+                so 1-3 also disable.
+
+        Returns:
+            The effective interval the modem is now running, or None on failure.
+            On success it is remembered so a reconnect restores it.
+
+        Raises:
+            ValueError: seconds outside 0-1020.
+        """
+        seconds = int(seconds)
+        if not 0 <= seconds <= AGC_RESET_INTERVAL_MAX_SEC:
+            raise ValueError(f"AGC reset interval must be 0-{AGC_RESET_INTERVAL_MAX_SEC} seconds")
+        resp = self._send_command(HW_CMD_SET_AGC_RESET_INTERVAL, struct.pack("<H", seconds))
+        if resp and resp[0] == HW_RESP_AGC_RESET_INTERVAL and len(resp[1]) >= 2:
+            effective = struct.unpack("<H", resp[1][:2])[0]
+            self.radio_config["agc_reset_interval_seconds"] = effective
+            return effective
+        return None
+
+    def get_agc_reset_interval(self) -> Optional[int]:
+        """Return the modem's effective AGC reset interval in seconds (0 = disabled)."""
+        resp = self._send_command(HW_CMD_GET_AGC_RESET_INTERVAL)
+        if resp and resp[0] == HW_RESP_AGC_RESET_INTERVAL and len(resp[1]) >= 2:
+            return struct.unpack("<H", resp[1][:2])[0]
+        return None
+
+    @staticmethod
+    def _decode_fem_state(payload: bytes) -> Dict[str, Optional[bool]]:
+        cap_mask, value_mask = payload[0], payload[1]
+
+        def bit(mask: int) -> Optional[bool]:
+            return bool(value_mask & mask) if cap_mask & mask else None
+
+        return {"rx_gain": bit(HW_FEM_RX_GAIN), "tx_gain": bit(HW_FEM_TX_GAIN)}
+
+    def get_fem_state(self) -> Optional[Dict[str, Optional[bool]]]:
+        """Return the board's external FEM gain state.
+
+        Returns:
+            ``{"rx_gain": ..., "tx_gain": ...}`` where each value is True/False, or
+            None when this board cannot control it. None overall on failure or on
+            firmware without FEM support.
+        """
+        resp = self._send_command(HW_CMD_GET_FEM_STATE)
+        if resp and resp[0] == HW_RESP_FEM_STATE and len(resp[1]) >= 2:
+            return self._decode_fem_state(resp[1])
+        return None
+
+    def set_fem_state(
+        self, rx_gain: Optional[bool] = None, tx_gain: Optional[bool] = None
+    ) -> Optional[Dict[str, Optional[bool]]]:
+        """Change external FEM gain; None leaves that control untouched.
+
+        The modem applies the request all-or-nothing and replies UNSUPPORTED if any
+        requested control is not available on this board. A request that arrives
+        mid-transmit is applied (and answered) when the packet ends.
+
+        Returns:
+            The resulting state (as get_fem_state), or None on failure. On success
+            the requested values are remembered so a reconnect restores them.
+        """
+        apply_mask = 0
+        value_mask = 0
+        for enabled, mask in ((rx_gain, HW_FEM_RX_GAIN), (tx_gain, HW_FEM_TX_GAIN)):
+            if enabled is not None:
+                apply_mask |= mask
+                if enabled:
+                    value_mask |= mask
+        if not apply_mask:
+            return self.get_fem_state()
+        # Allow for the reply being held until an in-flight transmit finishes.
+        resp = self._send_command(
+            HW_CMD_SET_FEM_STATE, bytes([apply_mask, value_mask]), timeout=2 * RESPONSE_TIMEOUT
+        )
+        if not (resp and resp[0] == HW_RESP_FEM_STATE and len(resp[1]) >= 2):
+            return None
+        if rx_gain is not None:
+            self.radio_config["fem_rx_gain"] = bool(rx_gain)
+        if tx_gain is not None:
+            self.radio_config["fem_tx_gain"] = bool(tx_gain)
+        return self._decode_fem_state(resp[1])
+
+    def set_fem_rx_gain(self, enabled: bool) -> bool:
+        """Enable/disable the external LNA. False if unsupported or on failure."""
+        state = self.set_fem_state(rx_gain=enabled)
+        return state is not None and state["rx_gain"] == bool(enabled)
+
+    def set_fem_tx_gain(self, enabled: bool) -> bool:
+        """Enable/disable external PA high gain. False if unsupported or on failure."""
+        state = self.set_fem_state(tx_gain=enabled)
+        return state is not None and state["tx_gain"] == bool(enabled)
+
     def _query_modem_info(self):
-        """Query modem version and identity"""
+        """Query modem version, identity, device name and capabilities"""
         try:
             # Get version
             version_resp = self._send_command(CMD_GET_VERSION)
@@ -1159,6 +1371,12 @@ class KissModemWrapper(LoRaRadio):
             device_name = self.get_device_name()
             if device_name:
                 logger.info(f"Modem device: {device_name}")
+
+            # Soft probe: pre-v2 firmware answers UNKNOWN_CMD, which reads as 0. Drop the
+            # cached value first; the modem may have been reflashed while disconnected.
+            self.modem_capabilities = None
+            caps = self.get_hardware_capabilities()
+            logger.info(f"Modem capabilities: 0x{caps:08X}")
 
         except Exception as e:
             logger.warning(f"Failed to query modem info: {e}")

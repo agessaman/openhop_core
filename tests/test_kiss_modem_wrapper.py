@@ -25,14 +25,29 @@ from openhop_core.hardware.kiss_modem_wrapper import (
     CMD_SET_RADIO,
     CMD_SET_TX_POWER,
     CMD_SIGN_DATA,
+    HW_CAP_AGC_RESET,
+    HW_CAP_FEM_RX_GAIN,
+    HW_CAP_FEM_TX_GAIN,
+    HW_CMD_GET_AGC_RESET_INTERVAL,
+    HW_CMD_GET_CAPABILITIES,
     HW_CMD_GET_DEVICE_NAME,
+    HW_CMD_GET_FEM_STATE,
     HW_CMD_GET_MCU_TEMP,
     HW_CMD_GET_SIGNAL_REPORT,
     HW_CMD_GET_VERSION,
     HW_CMD_REBOOT,
+    HW_CMD_SET_AGC_RESET_INTERVAL,
+    HW_CMD_SET_FEM_STATE,
     HW_CMD_SET_SIGNAL_REPORT,
     HW_ERR_TX_BUSY,
+    HW_ERR_UNKNOWN_CMD,
+    HW_ERR_UNSUPPORTED,
+    HW_FEM_RX_GAIN,
+    HW_FEM_TX_GAIN,
+    HW_RESP_AGC_RESET_INTERVAL,
+    HW_RESP_CAPABILITIES,
     HW_RESP_DEVICE_NAME,
+    HW_RESP_FEM_STATE,
     HW_RESP_MCU_TEMP,
     HW_RESP_OK,
     HW_RESP_RX_META,
@@ -2944,3 +2959,285 @@ class TestKissSendVerdictOwnership:
 
         with pytest.raises(Exception, match="mine: TX_DONE status=0x00"):
             await modem.send(b"\x01\x02\x03\x04")
+
+
+class _FakeV2Modem:
+    """Answers the v2 SetHardware commands like KissModem.cpp, for _send_command."""
+
+    def __init__(self, caps=HW_CAP_AGC_RESET, agc=30, fem_value=0):
+        self.caps = caps
+        self.agc = agc
+        self.fem_value = fem_value
+        self.calls: list[tuple[int, bytes]] = []
+
+    @property
+    def fem_caps(self):
+        mask = 0
+        if self.caps & HW_CAP_FEM_RX_GAIN:
+            mask |= HW_FEM_RX_GAIN
+        if self.caps & HW_CAP_FEM_TX_GAIN:
+            mask |= HW_FEM_TX_GAIN
+        return mask
+
+    def __call__(self, cmd, data=b"", timeout=5.0):
+        self.calls.append((cmd, bytes(data)))
+        if cmd == HW_CMD_GET_CAPABILITIES:
+            return (HW_RESP_CAPABILITIES, struct.pack("<I", self.caps))
+        if cmd == HW_CMD_SET_AGC_RESET_INTERVAL:
+            secs = struct.unpack("<H", data)[0]
+            if secs > 1020:
+                return (RESP_ERROR, bytes([0x02]))
+            self.agc = secs - secs % 4
+            return (HW_RESP_AGC_RESET_INTERVAL, struct.pack("<H", self.agc))
+        if cmd == HW_CMD_GET_AGC_RESET_INTERVAL:
+            return (HW_RESP_AGC_RESET_INTERVAL, struct.pack("<H", self.agc))
+        if cmd == HW_CMD_SET_FEM_STATE:
+            apply_mask, value_mask = data[0], data[1]
+            if apply_mask & ~self.fem_caps:
+                return (RESP_ERROR, bytes([HW_ERR_UNSUPPORTED]))
+            self.fem_value = (self.fem_value & ~apply_mask) | (value_mask & apply_mask)
+            return (HW_RESP_FEM_STATE, bytes([self.fem_caps, self.fem_value]))
+        if cmd == HW_CMD_GET_FEM_STATE:
+            return (HW_RESP_FEM_STATE, bytes([self.fem_caps, self.fem_value]))
+        return None
+
+    def sent(self, cmd):
+        return [data for c, data in self.calls if c == cmd]
+
+
+def _v2_modem(fake, radio_config=None):
+    modem = KissModemWrapper(port="/dev/null", auto_configure=False, radio_config=radio_config)
+    modem._send_command = fake
+    modem.is_connected = True
+    return modem
+
+
+class TestHardwareCapabilities:
+    def test_decodes_capability_bits(self):
+        fake = _FakeV2Modem(caps=HW_CAP_AGC_RESET | HW_CAP_FEM_RX_GAIN)
+        modem = _v2_modem(fake)
+        assert modem.get_hardware_capabilities() == HW_CAP_AGC_RESET | HW_CAP_FEM_RX_GAIN
+        assert modem.supports_agc_reset_control() is True
+        assert modem.supports_fem_rx_gain() is True
+        assert modem.supports_fem_tx_gain() is False
+        # Cached after the first probe
+        assert len(fake.sent(HW_CMD_GET_CAPABILITIES)) == 1
+
+    def test_pre_v2_firmware_unknown_cmd_reads_as_no_capabilities(self):
+        modem = KissModemWrapper(port="/dev/null", auto_configure=False)
+        modem._send_command = MagicMock(return_value=(RESP_ERROR, bytes([HW_ERR_UNKNOWN_CMD])))
+        assert modem.get_hardware_capabilities() == 0
+        assert modem.modem_capabilities == 0
+        assert modem.supports_agc_reset_control() is False
+        assert modem._send_command.call_count == 1
+
+    def test_unanswered_probe_is_not_cached(self):
+        modem = KissModemWrapper(port="/dev/null", auto_configure=False)
+        modem._send_command = MagicMock(return_value=None)
+        assert modem.get_hardware_capabilities() == 0
+        assert modem.modem_capabilities is None
+        modem.get_hardware_capabilities()
+        assert modem._send_command.call_count == 2
+
+    def test_query_modem_info_reprobes_capabilities(self):
+        fake = _FakeV2Modem(caps=HW_CAP_AGC_RESET | HW_CAP_FEM_TX_GAIN)
+        modem = _v2_modem(fake)
+        modem.modem_capabilities = HW_CAP_AGC_RESET  # stale value from a previous link
+        modem._query_modem_info()
+        assert modem.modem_capabilities == HW_CAP_AGC_RESET | HW_CAP_FEM_TX_GAIN
+
+    def test_query_modem_info_tolerates_old_firmware(self):
+        modem = KissModemWrapper(port="/dev/null", auto_configure=False)
+
+        def old_firmware(cmd, data=b"", timeout=5.0):
+            if cmd == HW_CMD_GET_VERSION:
+                return (RESP_VERSION, bytes([1, 0]))
+            return (RESP_ERROR, bytes([HW_ERR_UNKNOWN_CMD]))
+
+        modem._send_command = old_firmware
+        modem._query_modem_info()
+        assert modem.modem_version == 1
+        assert modem.modem_capabilities == 0
+
+
+class TestAgcResetInterval:
+    def test_set_returns_effective_rounded_value(self):
+        fake = _FakeV2Modem()
+        modem = _v2_modem(fake)
+        assert modem.set_agc_reset_interval(10) == 8
+        assert fake.sent(HW_CMD_SET_AGC_RESET_INTERVAL) == [struct.pack("<H", 10)]
+        # Remembered so a reconnect restores what the modem is actually running
+        assert modem.radio_config["agc_reset_interval_seconds"] == 8
+
+    def test_set_zero_disables(self):
+        modem = _v2_modem(_FakeV2Modem())
+        assert modem.set_agc_reset_interval(0) == 0
+
+    def test_set_out_of_range_raises_without_sending(self):
+        fake = _FakeV2Modem()
+        modem = _v2_modem(fake)
+        with pytest.raises(ValueError):
+            modem.set_agc_reset_interval(1021)
+        with pytest.raises(ValueError):
+            modem.set_agc_reset_interval(-1)
+        assert fake.calls == []
+
+    def test_set_failure_returns_none_and_keeps_config(self):
+        modem = KissModemWrapper(
+            port="/dev/null", auto_configure=False, radio_config={"agc_reset_interval_seconds": 4}
+        )
+        modem._send_command = MagicMock(return_value=(RESP_ERROR, bytes([HW_ERR_UNKNOWN_CMD])))
+        assert modem.set_agc_reset_interval(8) is None
+        assert modem.radio_config["agc_reset_interval_seconds"] == 4
+
+    def test_get_parses_uint16(self):
+        modem = _v2_modem(_FakeV2Modem(agc=1020))
+        assert modem.get_agc_reset_interval() == 1020
+
+    def test_get_returns_none_on_old_firmware(self):
+        modem = KissModemWrapper(port="/dev/null", auto_configure=False)
+        modem._send_command = MagicMock(return_value=(RESP_ERROR, bytes([HW_ERR_UNKNOWN_CMD])))
+        assert modem.get_agc_reset_interval() is None
+
+    def test_set_round_trip_via_real_send_command(self):
+        """SET_AGC_RESET_INTERVAL (0x1C) is answered with 0x9D, not 0x9C."""
+        modem = KissModemWrapper(port="/dev/null", auto_configure=False)
+        modem.is_connected = True
+        mock_serial = MagicMock()
+        mock_serial.is_open = True
+        mock_serial.write.side_effect = lambda b: len(b)
+        modem.serial_conn = mock_serial
+
+        result: dict[str, object] = {}
+        t = threading.Thread(target=lambda: result.update(v=modem.set_agc_reset_interval(4)))
+        started = time.monotonic()
+        t.start()
+        time.sleep(0.05)
+        for b in bytes(
+            [KISS_FEND, KISS_CMD_SETHARDWARE, HW_RESP_AGC_RESET_INTERVAL, 0x04, 0x00, KISS_FEND]
+        ):
+            modem._decode_kiss_byte(b)
+        t.join(timeout=2.0)
+
+        assert result.get("v") == 4
+        assert time.monotonic() - started < RESPONSE_TIMEOUT
+        assert len(modem._response_queue) == 0
+
+
+class TestFemState:
+    def test_set_rx_gain_sends_rx_only_masks(self):
+        fake = _FakeV2Modem(caps=HW_CAP_AGC_RESET | HW_CAP_FEM_RX_GAIN | HW_CAP_FEM_TX_GAIN)
+        modem = _v2_modem(fake)
+        assert modem.set_fem_rx_gain(True) is True
+        assert fake.sent(HW_CMD_SET_FEM_STATE) == [bytes([HW_FEM_RX_GAIN, HW_FEM_RX_GAIN])]
+        assert modem.radio_config["fem_rx_gain"] is True
+        assert "fem_tx_gain" not in modem.radio_config
+
+    def test_set_tx_gain_off_sends_tx_only_masks(self):
+        fake = _FakeV2Modem(
+            caps=HW_CAP_AGC_RESET | HW_CAP_FEM_RX_GAIN | HW_CAP_FEM_TX_GAIN,
+            fem_value=HW_FEM_RX_GAIN | HW_FEM_TX_GAIN,
+        )
+        modem = _v2_modem(fake)
+        assert modem.set_fem_tx_gain(False) is True
+        assert fake.sent(HW_CMD_SET_FEM_STATE) == [bytes([HW_FEM_TX_GAIN, 0x00])]
+        assert modem.get_fem_state() == {"rx_gain": True, "tx_gain": False}
+
+    def test_set_both_in_one_command(self):
+        fake = _FakeV2Modem(caps=HW_CAP_AGC_RESET | HW_CAP_FEM_RX_GAIN | HW_CAP_FEM_TX_GAIN)
+        modem = _v2_modem(fake)
+        state = modem.set_fem_state(rx_gain=False, tx_gain=True)
+        assert state == {"rx_gain": False, "tx_gain": True}
+        assert fake.sent(HW_CMD_SET_FEM_STATE) == [
+            bytes([HW_FEM_RX_GAIN | HW_FEM_TX_GAIN, HW_FEM_TX_GAIN])
+        ]
+
+    def test_unsupported_control_is_a_clean_failure(self):
+        fake = _FakeV2Modem(caps=HW_CAP_AGC_RESET | HW_CAP_FEM_RX_GAIN)
+        modem = _v2_modem(fake)
+        assert modem.set_fem_tx_gain(True) is False
+        assert "fem_tx_gain" not in modem.radio_config
+
+    def test_get_reports_uncontrollable_as_none(self):
+        modem = _v2_modem(_FakeV2Modem(caps=HW_CAP_AGC_RESET | HW_CAP_FEM_RX_GAIN, fem_value=1))
+        assert modem.get_fem_state() == {"rx_gain": True, "tx_gain": None}
+
+    def test_get_returns_none_on_old_firmware(self):
+        modem = KissModemWrapper(port="/dev/null", auto_configure=False)
+        modem._send_command = MagicMock(return_value=(RESP_ERROR, bytes([HW_ERR_UNKNOWN_CMD])))
+        assert modem.get_fem_state() is None
+
+
+class TestOptionalHardwareConfig:
+    def _handshake(self, fake, radio_config):
+        modem = _v2_modem(fake, radio_config=radio_config)
+        modem._post_connect_settle_s = 0
+        modem._set_kiss_tx_delay = MagicMock()
+        modem._run_post_connect_handshake()
+        return modem
+
+    def test_omitted_config_sends_no_optional_commands(self):
+        fake = _FakeV2Modem(caps=HW_CAP_AGC_RESET | HW_CAP_FEM_RX_GAIN | HW_CAP_FEM_TX_GAIN)
+        self._handshake(fake, {"frequency": 869618000})
+        for cmd in (HW_CMD_SET_AGC_RESET_INTERVAL, HW_CMD_SET_FEM_STATE):
+            assert fake.sent(cmd) == []
+
+    def test_configured_settings_are_applied_after_radio_setup(self):
+        fake = _FakeV2Modem(caps=HW_CAP_AGC_RESET | HW_CAP_FEM_RX_GAIN | HW_CAP_FEM_TX_GAIN)
+        modem = self._handshake(
+            fake,
+            {"agc_reset_interval_seconds": 4, "fem_rx_gain": True, "fem_tx_gain": False},
+        )
+        cmds = [c for c, _ in fake.calls]
+        assert cmds.index(HW_CMD_GET_CAPABILITIES) < cmds.index(HW_CMD_SET_AGC_RESET_INTERVAL)
+        assert fake.agc == 4
+        assert fake.sent(HW_CMD_SET_FEM_STATE) == [
+            bytes([HW_FEM_RX_GAIN | HW_FEM_TX_GAIN, HW_FEM_RX_GAIN])
+        ]
+        assert modem.get_fem_state() == {"rx_gain": True, "tx_gain": False}
+
+    def test_partial_capabilities_only_attempt_supported_controls(self, caplog):
+        fake = _FakeV2Modem(caps=HW_CAP_AGC_RESET | HW_CAP_FEM_RX_GAIN)
+        with caplog.at_level("WARNING", logger="KissModemWrapper"):
+            self._handshake(fake, {"fem_rx_gain": True, "fem_tx_gain": True})
+        assert fake.sent(HW_CMD_SET_FEM_STATE) == [bytes([HW_FEM_RX_GAIN, HW_FEM_RX_GAIN])]
+        assert "FEM TX gain cannot be applied" in caplog.text
+
+    def test_old_firmware_warns_but_handshake_succeeds(self, caplog):
+        modem = KissModemWrapper(
+            port="/dev/null",
+            auto_configure=False,
+            radio_config={"agc_reset_interval_seconds": 4, "fem_rx_gain": True},
+        )
+        modem._send_command = MagicMock(return_value=(RESP_ERROR, bytes([HW_ERR_UNKNOWN_CMD])))
+        modem._post_connect_settle_s = 0
+        modem._set_kiss_tx_delay = MagicMock()
+        with caplog.at_level("WARNING", logger="KissModemWrapper"):
+            assert modem._run_post_connect_handshake() is True
+        sent = [c.args[0] for c in modem._send_command.call_args_list]
+        assert HW_CMD_SET_AGC_RESET_INTERVAL not in sent
+        assert HW_CMD_SET_FEM_STATE not in sent
+        assert "AGC reset interval (4s) cannot be applied" in caplog.text
+        assert "FEM RX gain cannot be applied" in caplog.text
+
+    def test_invalid_agc_value_is_logged_not_raised(self, caplog):
+        fake = _FakeV2Modem()
+        with caplog.at_level("WARNING", logger="KissModemWrapper"):
+            self._handshake(fake, {"agc_reset_interval_seconds": 5000})
+        assert fake.sent(HW_CMD_SET_AGC_RESET_INTERVAL) == []
+        assert "Invalid agc_reset_interval_seconds" in caplog.text
+
+    def test_reconnect_reapplies_runtime_changes(self):
+        """A value set at runtime (e.g. via CLI) survives a USB reconnect."""
+        fake = _FakeV2Modem(caps=HW_CAP_AGC_RESET | HW_CAP_FEM_RX_GAIN)
+        modem = self._handshake(fake, {})
+        modem.set_agc_reset_interval(4)
+        modem.set_fem_rx_gain(True)
+
+        # Modem re-enumerates with firmware defaults
+        fake.agc, fake.fem_value = 30, 0
+        fake.calls.clear()
+        modem._run_post_connect_handshake()
+
+        assert fake.agc == 4
+        assert fake.fem_value == HW_FEM_RX_GAIN
