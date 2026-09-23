@@ -3241,3 +3241,127 @@ class TestOptionalHardwareConfig:
 
         assert fake.agc == 4
         assert fake.fem_value == HW_FEM_RX_GAIN
+
+
+class TestStateReplyRaces:
+    """0x9D/0x9F carry no request id; a late reply must not confirm a newer request."""
+
+    @pytest.fixture
+    def modem(self, monkeypatch):
+        # set_fem_state waits 2 * RESPONSE_TIMEOUT; keep the timed-out requests quick.
+        monkeypatch.setattr(kiss_modem_wrapper, "RESPONSE_TIMEOUT", 0.05)
+        modem = KissModemWrapper(port="/dev/null", auto_configure=False)
+        modem.is_connected = True
+        modem.modem_capabilities = HW_CAP_AGC_RESET | HW_CAP_FEM_RX_GAIN | HW_CAP_FEM_TX_GAIN
+        self.writes = []
+        mock_serial = MagicMock()
+        mock_serial.is_open = True
+
+        def write(b):
+            self.writes.append(bytes(b))
+            return len(b)
+
+        mock_serial.write.side_effect = write
+        modem.serial_conn = mock_serial
+        return modem
+
+    @staticmethod
+    def _feed(modem, sub_cmd, payload):
+        for b in bytes([KISS_FEND, KISS_CMD_SETHARDWARE, sub_cmd, *payload, KISS_FEND]):
+            modem._decode_kiss_byte(b)
+
+    def _call_with_reply(self, modem, fn, sub_cmd, payload):
+        """Run fn in a thread and answer its request once it has been written."""
+        result = {}
+        before = len(self.writes)
+        t = threading.Thread(target=lambda: result.update(v=fn()))
+        t.start()
+        deadline = time.monotonic() + 2.0
+        while len(self.writes) == before and time.monotonic() < deadline:
+            time.sleep(0.005)
+        assert len(self.writes) > before, "request was never sent"
+        self._feed(modem, sub_cmd, payload)
+        t.join(timeout=2.0)
+        return result.get("v")
+
+    def test_stale_fem_reply_is_discarded_not_returned(self, modem):
+        # A deferred request times out; its reply (TX gain on) arrives afterwards.
+        assert modem.set_fem_tx_gain(True) is False
+        self._feed(modem, HW_RESP_FEM_STATE, [0x03, HW_FEM_TX_GAIN])
+
+        ok = self._call_with_reply(
+            modem,
+            lambda: modem.set_fem_rx_gain(True),
+            HW_RESP_FEM_STATE,
+            [0x03, HW_FEM_RX_GAIN | HW_FEM_TX_GAIN],
+        )
+
+        assert ok is True
+        assert self.writes[-1][2:5] == bytes([HW_CMD_SET_FEM_STATE, HW_FEM_RX_GAIN, HW_FEM_RX_GAIN])
+        assert len(modem._response_queue) == 0
+
+    def test_late_reply_during_newer_request_does_not_confirm_it(self, modem):
+        # Request 1 (RX on) times out mid-TX. Request 2 (TX on) then receives
+        # request 1's reply, which shows TX gain still off.
+        assert modem.set_fem_rx_gain(True) is False
+        ok = self._call_with_reply(
+            modem,
+            lambda: modem.set_fem_tx_gain(True),
+            HW_RESP_FEM_STATE,
+            [0x03, HW_FEM_RX_GAIN],
+        )
+
+        assert ok is False
+        assert "fem_tx_gain" not in modem.radio_config
+        # What the modem did report is recorded as confirmed
+        assert modem.applied_hardware_config == {"fem_rx_gain": True, "fem_tx_gain": False}
+
+    def test_tx_busy_for_second_fem_request_fails_without_recording(self, modem):
+        ok = self._call_with_reply(
+            modem, lambda: modem.set_fem_rx_gain(True), RESP_ERROR, [HW_ERR_TX_BUSY]
+        )
+        assert ok is False
+        assert "fem_rx_gain" not in modem.radio_config
+        assert modem.applied_hardware_config == {}
+
+    def test_stale_agc_reply_is_discarded(self, modem):
+        assert modem.set_agc_reset_interval(300) is None  # times out
+        self._feed(modem, HW_RESP_AGC_RESET_INTERVAL, [0x2C, 0x01])  # its late 300
+
+        interval = self._call_with_reply(
+            modem, modem.get_agc_reset_interval, HW_RESP_AGC_RESET_INTERVAL, [0x04, 0x00]
+        )
+        assert interval == 4
+        assert modem.applied_hardware_config["agc_reset_interval_seconds"] == 4
+
+    def test_agc_upper_bound(self, modem):
+        effective = self._call_with_reply(
+            modem,
+            lambda: modem.set_agc_reset_interval(1020),
+            HW_RESP_AGC_RESET_INTERVAL,
+            [0xFC, 0x03],
+        )
+        assert effective == 1020
+        assert self.writes[-1][2:5] == bytes([HW_CMD_SET_AGC_RESET_INTERVAL, 0xFC, 0x03])
+        with pytest.raises(ValueError):
+            modem.set_agc_reset_interval(1024)
+
+
+class TestAppliedHardwareConfig:
+    def test_configured_but_unsupported_is_not_recorded_as_applied(self):
+        fake = _FakeV2Modem(caps=HW_CAP_AGC_RESET)
+        modem = _v2_modem(fake, radio_config={"agc_reset_interval_seconds": 4, "fem_rx_gain": True})
+        modem._post_connect_settle_s = 0
+        modem._set_kiss_tx_delay = MagicMock()
+        modem._run_post_connect_handshake()
+        assert modem.applied_hardware_config == {"agc_reset_interval_seconds": 4}
+        assert modem.radio_config["fem_rx_gain"] is True  # still desired
+
+    def test_reconnect_clears_confirmed_state_before_reapplying(self):
+        fake = _FakeV2Modem()
+        modem = _v2_modem(fake)
+        modem.set_agc_reset_interval(8)
+        modem._send_command = MagicMock(return_value=None)  # new link, silent modem
+        modem._query_modem_info()
+        assert modem.applied_hardware_config == {}
+        assert modem.radio_config["agc_reset_interval_seconds"] == 8

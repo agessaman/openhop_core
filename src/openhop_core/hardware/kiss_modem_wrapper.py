@@ -301,6 +301,18 @@ class KissModemWrapper(LoRaRadio):
         HW_CMD_SET_FEM_STATE: HW_RESP_FEM_STATE,
     }
 
+    # Commands whose reply is a snapshot of modem state that shares its code with
+    # other requests (0x9D, 0x9F) and carries no request id. A queued reply for one
+    # of these is a leftover from an earlier timed-out request -- a deferred
+    # SetFemState answers only when the in-flight TX ends -- so it is discarded
+    # rather than returned as this request's answer.
+    _SETHW_FRESH_REPLY_ONLY: set[int] = {
+        HW_CMD_SET_AGC_RESET_INTERVAL,
+        HW_CMD_GET_AGC_RESET_INTERVAL,
+        HW_CMD_SET_FEM_STATE,
+        HW_CMD_GET_FEM_STATE,
+    }
+
     def __init__(
         self,
         port: str,
@@ -497,6 +509,10 @@ class KissModemWrapper(LoRaRadio):
         self.modem_identity: Optional[bytes] = None
         # GetCapabilities feature bits; None until probed, 0 on pre-v2 firmware.
         self.modem_capabilities: Optional[int] = None
+        # AGC/FEM values the modem has confirmed on this link, keyed like radio_config.
+        # radio_config holds what should be applied (and is re-sent on reconnect);
+        # this holds only what a modem reply reported, and is cleared on reconnect.
+        self.applied_hardware_config: Dict[str, Any] = {}
 
     def set_event_loop(self, loop: asyncio.AbstractEventLoop) -> None:
         """
@@ -1274,6 +1290,7 @@ class KissModemWrapper(LoRaRadio):
         if resp and resp[0] == HW_RESP_AGC_RESET_INTERVAL and len(resp[1]) >= 2:
             effective = struct.unpack("<H", resp[1][:2])[0]
             self.radio_config["agc_reset_interval_seconds"] = effective
+            self.applied_hardware_config["agc_reset_interval_seconds"] = effective
             return effective
         return None
 
@@ -1281,8 +1298,17 @@ class KissModemWrapper(LoRaRadio):
         """Return the modem's effective AGC reset interval in seconds (0 = disabled)."""
         resp = self._send_command(HW_CMD_GET_AGC_RESET_INTERVAL)
         if resp and resp[0] == HW_RESP_AGC_RESET_INTERVAL and len(resp[1]) >= 2:
-            return struct.unpack("<H", resp[1][:2])[0]
+            interval = struct.unpack("<H", resp[1][:2])[0]
+            self.applied_hardware_config["agc_reset_interval_seconds"] = interval
+            return interval
         return None
+
+    def _record_fem_state(self, payload: bytes) -> Dict[str, Optional[bool]]:
+        state = self._decode_fem_state(payload)
+        for key, value in state.items():
+            if value is not None:
+                self.applied_hardware_config[f"fem_{key}"] = value
+        return state
 
     @staticmethod
     def _decode_fem_state(payload: bytes) -> Dict[str, Optional[bool]]:
@@ -1303,7 +1329,7 @@ class KissModemWrapper(LoRaRadio):
         """
         resp = self._send_command(HW_CMD_GET_FEM_STATE)
         if resp and resp[0] == HW_RESP_FEM_STATE and len(resp[1]) >= 2:
-            return self._decode_fem_state(resp[1])
+            return self._record_fem_state(resp[1])
         return None
 
     def set_fem_state(
@@ -1316,8 +1342,9 @@ class KissModemWrapper(LoRaRadio):
         mid-transmit is applied (and answered) when the packet ends.
 
         Returns:
-            The resulting state (as get_fem_state), or None on failure. On success
-            the requested values are remembered so a reconnect restores them.
+            The state the modem reported (as get_fem_state), or None on failure.
+            Requested values the reply confirms are remembered so a reconnect
+            restores them; callers should check the state, not just non-None.
         """
         apply_mask = 0
         value_mask = 0
@@ -1334,11 +1361,13 @@ class KissModemWrapper(LoRaRadio):
         )
         if not (resp and resp[0] == HW_RESP_FEM_STATE and len(resp[1]) >= 2):
             return None
-        if rx_gain is not None:
-            self.radio_config["fem_rx_gain"] = bool(rx_gain)
-        if tx_gain is not None:
-            self.radio_config["fem_tx_gain"] = bool(tx_gain)
-        return self._decode_fem_state(resp[1])
+        # Trust the reported state, not the request: without a request id the reply
+        # could still belong to an earlier request that timed out mid-TX.
+        state = self._record_fem_state(resp[1])
+        for key, requested in (("rx_gain", rx_gain), ("tx_gain", tx_gain)):
+            if requested is not None and state[key] == bool(requested):
+                self.radio_config[f"fem_{key}"] = bool(requested)
+        return state
 
     def set_fem_rx_gain(self, enabled: bool) -> bool:
         """Enable/disable the external LNA. False if unsupported or on failure."""
@@ -1375,6 +1404,7 @@ class KissModemWrapper(LoRaRadio):
             # Soft probe: pre-v2 firmware answers UNKNOWN_CMD, which reads as 0. Drop the
             # cached value first; the modem may have been reflashed while disconnected.
             self.modem_capabilities = None
+            self.applied_hardware_config = {}
             caps = self.get_hardware_capabilities()
             logger.info(f"Modem capabilities: 0x{caps:08X}")
 
@@ -1654,6 +1684,17 @@ class KissModemWrapper(LoRaRadio):
 
             # Check queued responses first (late/out-of-order arrivals).
             with self._response_lock:
+                if sub_cmd in self._SETHW_FRESH_REPLY_ONLY and self._response_queue:
+                    stale = [r for r in self._response_queue if r[0] in acceptable]
+                    if stale:
+                        logger.debug(
+                            "Discarding %d stale reply(s) before sub_cmd 0x%02X",
+                            len(stale),
+                            sub_cmd,
+                        )
+                        kept = [r for r in self._response_queue if r[0] not in acceptable]
+                        self._response_queue.clear()
+                        self._response_queue.extend(kept)
                 if self._response_queue:
                     n = len(self._response_queue)
                     matched: Optional[tuple[int, bytes]] = None
