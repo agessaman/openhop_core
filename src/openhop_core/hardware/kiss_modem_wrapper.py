@@ -522,6 +522,13 @@ class KissModemWrapper(LoRaRadio):
         # radio_config holds what should be applied (and is re-sent on reconnect);
         # this holds only what a modem reply reported, and is cleared on reconnect.
         self.applied_hardware_config: Dict[str, Any] = {}
+        # Receive errors the modem counted since this wrapper first connected,
+        # accumulated across modem resets and reconnects so it only ever rises,
+        # like SX1262Wrapper's counter. The modem's GetStats "errors" field is
+        # MeshCore's n_recv_errors: a failed readData(), which on its radios is a
+        # CRC mismatch. Refresh with refresh_crc_error_count().
+        self.crc_error_count = 0
+        self._modem_errors_seen: Optional[int] = None
 
     def set_event_loop(self, loop: asyncio.AbstractEventLoop) -> None:
         """
@@ -1466,6 +1473,12 @@ class KissModemWrapper(LoRaRadio):
             caps = self.get_hardware_capabilities()
             logger.info(f"Modem capabilities: 0x{caps:08X}")
 
+            # Baseline the error counter for this link, so errors the modem counted
+            # before openHop connected (or while it was unplugged) are not reported
+            # as new ones.
+            self._modem_errors_seen = None
+            self.get_modem_stats()
+
         except Exception as e:
             logger.warning(f"Failed to query modem info: {e}")
 
@@ -1941,8 +1954,28 @@ class KissModemWrapper(LoRaRadio):
         resp = self._send_command(CMD_GET_STATS, timeout=t)
         if resp and resp[0] == RESP_STATS and len(resp[1]) >= 12:
             rx, tx, errors = struct.unpack("<III", resp[1][:12])
+            self._account_modem_errors(errors)
             return {"rx": rx, "tx": tx, "errors": errors}
         return None
+
+    def _account_modem_errors(self, errors: int) -> None:
+        """Fold the modem's cumulative error counter into crc_error_count."""
+        seen = self._modem_errors_seen
+        self._modem_errors_seen = errors
+        if seen is None:
+            return  # first reading on this link: a baseline, not new errors
+        # A counter that went down means the modem restarted and began again from
+        # zero, so everything it holds now is new.
+        self.crc_error_count += errors - seen if errors >= seen else errors
+
+    def refresh_crc_error_count(self, timeout: Optional[float] = None) -> Optional[int]:
+        """Poll the modem's receive-error counter; returns crc_error_count, or None.
+
+        Blocking (one SetHardware round trip); run it off the event loop.
+        """
+        if self.get_modem_stats(timeout=timeout) is None:
+            return None
+        return self.crc_error_count
 
     def get_battery(self, timeout: Optional[float] = None) -> Optional[int]:
         """Get battery voltage in millivolts.
@@ -2369,6 +2402,7 @@ class KissModemWrapper(LoRaRadio):
             "last_snr": self.stats.get("last_snr", -999.0),
             "last_signal_rssi": self.stats.get("last_rssi", -999),
             "hardware_ready": self.is_connected,
+            "crc_error_count": self.crc_error_count,
         }
         return status
 

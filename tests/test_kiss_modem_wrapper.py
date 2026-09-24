@@ -3472,3 +3472,64 @@ class TestRxBoostedGain:
         t.join(timeout=3.0)
         assert result.get("v") is False
         assert len(modem._response_queue) == 0
+
+
+class TestCrcErrorCount:
+    """GetStats' errors field (MeshCore n_recv_errors) as crc_error_count."""
+
+    @staticmethod
+    def _modem_reporting(*error_counts):
+        modem = KissModemWrapper(port="/dev/null", auto_configure=False)
+        replies = iter(error_counts)
+
+        def send(cmd, data=b"", timeout=5.0):
+            if cmd != CMD_GET_STATS:
+                return (RESP_ERROR, bytes([HW_ERR_UNKNOWN_CMD]))
+            errors = next(replies)
+            if errors is None:
+                return None
+            return (RESP_STATS, struct.pack("<III", 100, 50, errors))
+
+        modem._send_command = send
+        return modem
+
+    def test_first_reading_is_a_baseline(self):
+        modem = self._modem_reporting(40, 43, 43, 50)
+        assert modem.refresh_crc_error_count() == 0  # 40 predate openHop
+        assert modem.refresh_crc_error_count() == 3
+        assert modem.refresh_crc_error_count() == 3
+        assert modem.refresh_crc_error_count() == 10
+
+    def test_modem_restart_keeps_the_count_rising(self):
+        modem = self._modem_reporting(40, 45, 2, 6)
+        modem.refresh_crc_error_count()
+        assert modem.refresh_crc_error_count() == 5
+        assert modem.refresh_crc_error_count() == 7  # counter restarted: 2 are new
+        assert modem.refresh_crc_error_count() == 11
+
+    def test_failed_poll_returns_none_and_keeps_the_count(self):
+        modem = self._modem_reporting(10, 12, None, 15)
+        modem.refresh_crc_error_count()
+        assert modem.refresh_crc_error_count() == 2
+        assert modem.refresh_crc_error_count() is None
+        assert modem.crc_error_count == 2
+        assert modem.refresh_crc_error_count() == 5
+
+    def test_reconnect_rebaselines_without_losing_the_total(self):
+        modem = self._modem_reporting(10, 14, 900, 903)
+        modem.refresh_crc_error_count()
+        modem.refresh_crc_error_count()
+        assert modem.crc_error_count == 4
+        # Reconnect handshake reads stats as the new link's baseline (another modem,
+        # or one that counted errors while unplugged): nothing is added for it.
+        modem._query_modem_info()
+        assert modem.crc_error_count == 4
+        assert modem.refresh_crc_error_count() == 7
+
+    def test_status_reports_the_count(self):
+        modem = self._modem_reporting(1, 4)
+        modem.refresh_crc_error_count()
+        modem.refresh_crc_error_count()
+        modem.get_radio_config = MagicMock(return_value=None)
+        modem.get_tx_power = MagicMock(return_value=None)
+        assert modem._sync_get_status()["crc_error_count"] == 3
