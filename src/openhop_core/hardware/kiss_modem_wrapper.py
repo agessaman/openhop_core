@@ -108,6 +108,8 @@ HW_CMD_SET_AGC_RESET_INTERVAL = 0x1C
 HW_CMD_GET_AGC_RESET_INTERVAL = 0x1D
 HW_CMD_SET_FEM_STATE = 0x1E
 HW_CMD_GET_FEM_STATE = 0x1F
+HW_CMD_SET_RX_BOOSTED_GAIN = 0x20
+HW_CMD_GET_RX_BOOSTED_GAIN = 0x21
 
 # SetHardware response sub-commands (TNC -> Host)
 # Spec: response = command | 0x80 for command responses; 0xF0+ for generic/unsolicited
@@ -138,16 +140,19 @@ HW_RESP_TX_DONE = 0xF8  # Unsolicited
 HW_RESP_RX_META = 0xF9  # Unsolicited
 HW_RESP_SIGNAL_REPORT = 0x9A  # HW_CMD_GET_SIGNAL_REPORT | 0x80
 HW_RESP_CAPABILITIES = 0x9B  # HW_CMD_GET_CAPABILITIES | 0x80
-# SET_AGC_RESET_INTERVAL and SET_FEM_STATE reply with these GET-form codes; 0x9C and
-# 0x9E are never sent.
+# SET_AGC_RESET_INTERVAL, SET_FEM_STATE and SET_RX_BOOSTED_GAIN reply with GET-form
+# codes; 0x9C, 0x9E and 0xA0 are never sent.
 HW_RESP_AGC_RESET_INTERVAL = 0x9D  # HW_CMD_GET_AGC_RESET_INTERVAL | 0x80
 HW_RESP_FEM_STATE = 0x9F  # HW_CMD_GET_FEM_STATE | 0x80
+HW_RESP_RX_BOOSTED_GAIN = 0xA1  # HW_CMD_GET_RX_BOOSTED_GAIN | 0x80; also answers the Set
 
 # GetCapabilities feature bits (uint32 LE). Probe these rather than inferring from the
 # firmware version: boards on the same version expose different hardware controls.
 HW_CAP_AGC_RESET = 1 << 0
 HW_CAP_FEM_RX_GAIN = 1 << 1
 HW_CAP_FEM_TX_GAIN = 1 << 2
+# The radio chip's own boosted RX gain (MeshCore radio.rxgain), separate from FEM RX gain.
+HW_CAP_RX_BOOSTED_GAIN = 1 << 3
 
 # SetFemState / FemState bit masks
 HW_FEM_RX_GAIN = 1 << 0  # external LNA enabled
@@ -299,6 +304,7 @@ class KissModemWrapper(LoRaRadio):
         HW_CMD_SET_SIGNAL_REPORT: HW_RESP_SIGNAL_REPORT,
         HW_CMD_SET_AGC_RESET_INTERVAL: HW_RESP_AGC_RESET_INTERVAL,
         HW_CMD_SET_FEM_STATE: HW_RESP_FEM_STATE,
+        HW_CMD_SET_RX_BOOSTED_GAIN: HW_RESP_RX_BOOSTED_GAIN,
     }
 
     # Commands whose reply is a snapshot of modem state that shares its code with
@@ -311,6 +317,8 @@ class KissModemWrapper(LoRaRadio):
         HW_CMD_GET_AGC_RESET_INTERVAL,
         HW_CMD_SET_FEM_STATE,
         HW_CMD_GET_FEM_STATE,
+        HW_CMD_SET_RX_BOOSTED_GAIN,
+        HW_CMD_GET_RX_BOOSTED_GAIN,
     }
 
     def __init__(
@@ -342,7 +350,8 @@ class KissModemWrapper(LoRaRadio):
                          default 50), kiss_persistence (0-255), kiss_slottime_ms,
                          kiss_txtail_ms (post-TX hold), kiss_full_duplex (bool),
                          agc_reset_interval_seconds (0-1020, 0 disables),
-                         fem_rx_gain (bool), fem_tx_gain (bool), and SetHardware
+                         fem_rx_gain (bool), fem_tx_gain (bool),
+                         rx_boosted_gain (bool), and SetHardware
                          options as needed. The AGC/FEM keys are optional: when
                          absent the modem keeps its firmware/board default. They
                          are re-applied after every reconnect.
@@ -861,6 +870,18 @@ class KissModemWrapper(LoRaRadio):
                     state["tx_gain"],
                 )
 
+        boosted = cfg.get("rx_boosted_gain")
+        if boosted is not None:
+            if not self.supports_rx_boosted_gain():
+                logger.warning(
+                    "Configured RX boosted gain cannot be applied: "
+                    "modem reports feature unsupported"
+                )
+            elif self.set_rx_boosted_gain(bool(boosted)) != bool(boosted):
+                logger.warning("Failed to apply RX boosted gain %s", bool(boosted))
+            else:
+                logger.info("Modem RX boosted gain set to %s", bool(boosted))
+
     def _close_serial_connection(self) -> None:
         """Close serial handle without waiting for worker threads."""
         conn = self.serial_conn
@@ -1378,6 +1399,43 @@ class KissModemWrapper(LoRaRadio):
         """Enable/disable external PA high gain. False if unsupported or on failure."""
         state = self.set_fem_state(tx_gain=enabled)
         return state is not None and state["tx_gain"] == bool(enabled)
+
+    def supports_rx_boosted_gain(self) -> bool:
+        return bool(self.get_hardware_capabilities() & HW_CAP_RX_BOOSTED_GAIN)
+
+    def get_rx_boosted_gain(self) -> Optional[bool]:
+        """Return whether the radio chip's boosted RX gain is on; None on failure/unsupported."""
+        resp = self._send_command(HW_CMD_GET_RX_BOOSTED_GAIN)
+        if resp and resp[0] == HW_RESP_RX_BOOSTED_GAIN and len(resp[1]) >= 1:
+            enabled = resp[1][0] != 0x00
+            self.applied_hardware_config["rx_boosted_gain"] = enabled
+            return enabled
+        return None
+
+    def set_rx_boosted_gain(self, enabled: bool) -> Optional[bool]:
+        """Set the radio chip's boosted RX gain (MeshCore ``radio.rxgain``).
+
+        The modem refuses while a packet is on air or host output is backed up, and
+        says so with TxBusy -- which never reaches the command path (see
+        HW_ERR_TX_BUSY) -- so a refused request shows up as a timeout. A reply comes
+        back at once otherwise, so use a short wait and try once more.
+
+        Returns:
+            The state the radio reports after the request, or None on failure. The
+            requested value is remembered for reconnects only if the radio confirms it.
+        """
+        payload = bytes([0x01 if enabled else 0x00])
+        for _ in range(2):
+            resp = self._send_command(HW_CMD_SET_RX_BOOSTED_GAIN, payload, timeout=2.0)
+            if resp and resp[0] == HW_RESP_ERROR:
+                return None
+            if resp and resp[0] == HW_RESP_RX_BOOSTED_GAIN and len(resp[1]) >= 1:
+                state = resp[1][0] != 0x00
+                self.applied_hardware_config["rx_boosted_gain"] = state
+                if state == bool(enabled):
+                    self.radio_config["rx_boosted_gain"] = bool(enabled)
+                return state
+        return None
 
     def _query_modem_info(self):
         """Query modem version, identity, device name and capabilities"""
