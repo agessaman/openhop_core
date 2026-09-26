@@ -466,3 +466,19 @@ def test_a_companion_without_radio_config_reports_and_keeps_the_radios_params():
     comp._apply_staged_radio_params()
 
     assert _retuned_to(radio) == []
+
+
+async def test_a_half_applied_retune_is_retried_on_the_next_reboot(radio):
+    """If re-arming RX fails after the chip took the new params, the radio must
+    not report them as running, or the next reboot would skip the retry."""
+    comp = CompanionRadio(radio, LocalIdentity())
+    comp.cli.handle("set radio 868.0,250,7,5")
+    radio.lora.request.side_effect = RuntimeError("SPI error")
+    comp.cli.handle("reboot")
+    assert radio.frequency == 915000000  # not applied as far as anyone can tell
+
+    radio.lora.request.side_effect = None
+    comp.cli.handle("reboot")
+
+    assert radio.frequency == 868000000
+    assert _retuned_to(radio) == [868000000, 868000000]

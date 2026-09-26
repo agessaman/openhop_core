@@ -1714,10 +1714,6 @@ class SX1262Radio(LoRaRadio):
             time.sleep(self._RADIO_TIMING_DELAY)
             self.lora.setFrequency(freq)
             self.lora.setLoRaModulation(sf, bw, cr, ldro)
-            self.frequency = freq
-            self.bandwidth = bw
-            self.spreading_factor = sf
-            self.coding_rate = cr
             self._noise_floor = -120.0
             self._num_floor_samples = 0
             self._floor_sample_sum = 0.0
@@ -1729,6 +1725,13 @@ class SX1262Radio(LoRaRadio):
             time.sleep(self._RADIO_TIMING_DELAY)
             self.lora.clearIrqStatus(0xFFFF)
             self._control_tx_rx_pins(tx_mode=False)
+            # Publish the new params only once the whole retune, RX re-arm
+            # included, has succeeded: callers read them as what the radio runs
+            # and would otherwise never retry a half-applied change.
+            self.frequency = freq
+            self.bandwidth = bw
+            self.spreading_factor = sf
+            self.coding_rate = cr
             logger.info(
                 "Radio reconfigured: %.3f MHz BW=%.1f kHz SF%d CR4/%d",
                 freq / 1e6,
