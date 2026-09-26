@@ -100,6 +100,11 @@ class _DeviceConfigMixin:
         self._save_prefs()
         return True
 
+    async def set_radio_params_async(self, freq_hz: int, bw_hz: int, sf: int, cr: int) -> bool:
+        """Awaitable :meth:`set_radio_params`; a radio-owning companion
+        overrides it to wait for an in-flight TX instead of queueing."""
+        return self.set_radio_params(freq_hz, bw_hz, sf, cr)
+
     def stage_radio_params(self, freq_hz: int, bw_hz: int, sf: int, cr: int) -> bool:
         """Persist radio parameters without touching the radio (CLI ``set radio``).
 

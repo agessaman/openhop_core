@@ -2574,29 +2574,3 @@ class TestCad:
         comp.prefs.cad_enabled = False  # restored by a persistence layer
         comp.reload_settings()
         assert radio.lbt_enabled is False
-
-
-class TestRebootRetuneWaitsForTx:
-    @pytest.mark.asyncio
-    async def test_staged_params_wait_for_an_in_flight_tx_instead_of_blocking(self):
-        """configure_radio waits for the TX lock synchronously; calling it while
-        a TX holds the lock would stall the loop (and that TX) for its whole
-        timeout. The retune is deferred on the loop until the TX finishes."""
-        radio = MockRadio()
-        radio._tx_lock = asyncio.Lock()
-        comp = CompanionRadio(radio, LocalIdentity())
-        comp.cli.handle("set radio 869.618,62.5,8,5")
-
-        await radio._tx_lock.acquire()  # a TX in flight
-        comp.cli.handle("reboot")
-        await asyncio.sleep(0.1)
-        assert radio.radio_params is None  # not while the TX runs
-
-        radio._tx_lock.release()
-        await _drain_background_tasks(comp)
-        assert radio.radio_params == {
-            "frequency": 869618000,
-            "bandwidth": 62500,
-            "spreading_factor": 8,
-            "coding_rate": 5,
-        }

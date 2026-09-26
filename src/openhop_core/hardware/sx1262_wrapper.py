@@ -4,6 +4,7 @@ Implements the LoRaRadio interface using the SX126x library
 """
 
 import asyncio
+import concurrent.futures
 import logging
 import math
 import random
@@ -169,6 +170,8 @@ class SX1262Radio(LoRaRadio):
         self._initialized = False
         self._rx_lock = asyncio.Lock()
         self._tx_lock = asyncio.Lock()
+        # A reconfigure scheduled to run once the in-flight TX ends.
+        self._pending_configure: Optional[asyncio.Task] = None
         # Set from writeBuffer until TX completes.
         self._tx_buffer_busy = False
 
@@ -1689,36 +1692,22 @@ class SX1262Radio(LoRaRadio):
             "set bandwidth", set_bw, f"Bandwidth set to {bw / 1000:.0f} kHz"
         )
 
-    def configure_radio(
-        self,
-        frequency: Optional[int] = None,
-        bandwidth: Optional[int] = None,
-        spreading_factor: Optional[int] = None,
-        coding_rate: Optional[int] = None,
-    ) -> bool:
-        """Reconfigure LoRa parameters inline without restarting the radio.
+    # How long a reconfigure may wait for an in-flight TX to release the radio.
+    CONFIGURE_TX_WAIT_SECONDS = 10.0
 
-        Any omitted parameter retains its current value. Waits for any
-        in-flight TX to complete before touching the hardware, then restores
-        RX_CONTINUOUS so the caller does not need to restart.
-        """
-        if not self._initialized or self.lora is None:
-            logger.error("Cannot configure radio: not initialised")
-            return False
+    def _resolve_radio_params(self, frequency, bandwidth, spreading_factor, coding_rate):
+        return (
+            frequency if frequency is not None else self.frequency,
+            bandwidth if bandwidth is not None else self.bandwidth,
+            spreading_factor if spreading_factor is not None else self.spreading_factor,
+            coding_rate if coding_rate is not None else self.coding_rate,
+        )
 
-        freq = frequency if frequency is not None else self.frequency
-        bw = bandwidth if bandwidth is not None else self.bandwidth
-        sf = spreading_factor if spreading_factor is not None else self.spreading_factor
-        cr = coding_rate if coding_rate is not None else self.coding_rate
+    def _apply_radio_params(self, freq: int, bw: int, sf: int, cr: int) -> bool:
+        """Retune the chip and restore RX_CONTINUOUS. The caller guarantees no
+        TX is in progress (it holds ``_tx_lock``, or runs on the loop thread
+        while the lock is free)."""
         ldro = sf >= 11 and bw <= 125000
-
-        deadline = time.monotonic() + 10.0
-        while self._tx_lock.locked():
-            if time.monotonic() > deadline:
-                logger.error("configure_radio: TX did not complete within 10s")
-                return False
-            time.sleep(0.05)
-
         try:
             self.lora.clearIrqStatus(0xFFFF)
             self.lora.setStandby(self.lora.STANDBY_RC)
@@ -1751,6 +1740,137 @@ class SX1262Radio(LoRaRadio):
         except Exception as e:
             logger.error("Failed to configure radio: %s", e)
             return False
+
+    @property
+    def pending_configure(self) -> Optional[asyncio.Task]:
+        """A reconfigure queued behind the in-flight TX, if any."""
+        return getattr(self, "_pending_configure", None)
+
+    def _supersede_pending_configure(self) -> None:
+        """A newer reconfigure (or cleanup) wins over one still waiting for its TX."""
+        pending = getattr(self, "_pending_configure", None)
+        self._pending_configure = None
+        if pending is None or pending.done():
+            return
+        try:
+            task_loop = pending.get_loop()
+            try:
+                on_task_loop = asyncio.get_running_loop() is task_loop
+            except RuntimeError:
+                on_task_loop = False
+            if on_task_loop or not task_loop.is_running():
+                pending.cancel()
+            else:
+                task_loop.call_soon_threadsafe(pending.cancel)
+        except RuntimeError as e:  # its loop is already closed
+            logger.debug("Could not cancel queued radio reconfigure: %s", e)
+
+    def _on_queued_configure_done(self, task: asyncio.Task) -> None:
+        if getattr(self, "_pending_configure", None) is task:
+            self._pending_configure = None
+        if task.cancelled():
+            return
+        exc = task.exception()
+        if exc is not None:
+            logger.error("Queued radio reconfigure failed: %s", exc)
+        elif task.result() is not True:
+            logger.error("Queued radio reconfigure was not applied")
+
+    async def configure_radio_async(
+        self,
+        frequency: Optional[int] = None,
+        bandwidth: Optional[int] = None,
+        spreading_factor: Optional[int] = None,
+        coding_rate: Optional[int] = None,
+    ) -> bool:
+        """Reconfigure LoRa parameters without restarting the radio.
+
+        Awaits any in-flight TX by taking ``_tx_lock`` and holds it for the
+        retune, so no TX can start mid-reconfigure and the event loop keeps
+        running while it waits. Omitted parameters keep their current value.
+        Returns False when not initialised or when the TX does not finish
+        within ``CONFIGURE_TX_WAIT_SECONDS``.
+        """
+        if not self._initialized or self.lora is None:
+            logger.error("Cannot configure radio: not initialised")
+            return False
+        try:
+            await asyncio.wait_for(self._tx_lock.acquire(), timeout=self.CONFIGURE_TX_WAIT_SECONDS)
+        except asyncio.TimeoutError:
+            logger.error(
+                "configure_radio: TX did not complete within %.0fs",
+                self.CONFIGURE_TX_WAIT_SECONDS,
+            )
+            return False
+        try:
+            if not self._initialized or self.lora is None:
+                return False
+            return self._apply_radio_params(
+                *self._resolve_radio_params(frequency, bandwidth, spreading_factor, coding_rate)
+            )
+        finally:
+            self._tx_lock.release()
+
+    def configure_radio(
+        self,
+        frequency: Optional[int] = None,
+        bandwidth: Optional[int] = None,
+        spreading_factor: Optional[int] = None,
+        coding_rate: Optional[int] = None,
+    ) -> bool:
+        """Synchronous reconfigure; prefer :meth:`configure_radio_async` from a coroutine.
+
+        ``_tx_lock`` is an asyncio lock, so this never waits for it by blocking:
+
+        - on the event-loop thread with no TX in flight, the retune runs at once
+          (nothing else can start a TX while this code runs);
+        - on the event-loop thread during a TX, the retune is scheduled to run
+          as soon as the TX releases the radio and True is returned: the
+          request is queued, not dropped, and a later reconfigure supersedes it;
+        - from another thread or another event loop (e.g. a web handler), it runs
+          on the radio's loop and this call waits for the result;
+        - when the radio's loop is not running, it runs directly.
+
+        A queued retune that later fails is logged; :attr:`pending_configure`
+        lets a caller follow it.
+        """
+        if not self._initialized or self.lora is None:
+            logger.error("Cannot configure radio: not initialised")
+            return False
+        params = (frequency, bandwidth, spreading_factor, coding_rate)
+
+        try:
+            running = asyncio.get_running_loop()
+        except RuntimeError:
+            running = None
+
+        loop = self._event_loop
+        # Only the radio's own loop may touch it without taking the TX lock: a
+        # coroutine on some other loop is as foreign as a worker thread.
+        if running is not None and (loop is None or running is loop):
+            self._supersede_pending_configure()
+            if not self._tx_lock.locked():
+                return self._apply_radio_params(*self._resolve_radio_params(*params))
+            logger.info("configure_radio: TX in progress; retuning once it completes")
+            task = running.create_task(self.configure_radio_async(*params))
+            task.add_done_callback(self._on_queued_configure_done)
+            self._pending_configure = task
+            return True
+
+        if loop is not None and loop.is_running():
+            try:
+                future = asyncio.run_coroutine_threadsafe(self.configure_radio_async(*params), loop)
+                return future.result(timeout=self.CONFIGURE_TX_WAIT_SECONDS + 2.0)
+            except concurrent.futures.TimeoutError:
+                future.cancel()
+                logger.error("configure_radio: timed out waiting for the radio's event loop")
+                return False
+            except RuntimeError as e:  # the loop closed under us
+                logger.error("configure_radio: radio event loop unavailable: %s", e)
+                return False
+
+        # No loop anywhere: nothing can be holding the asyncio TX lock.
+        return self._apply_radio_params(*self._resolve_radio_params(*params))
 
     def get_status(self) -> dict:
         """Get radio status information"""
@@ -2294,6 +2414,7 @@ class SX1262Radio(LoRaRadio):
     def cleanup(self) -> None:
         """Clean up this radio instance's resources only."""
         self._shutting_down = True
+        self._supersede_pending_configure()
         self._event_loop = None
         self._interrupt_setup = False
 

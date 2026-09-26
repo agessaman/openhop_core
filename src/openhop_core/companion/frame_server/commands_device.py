@@ -421,7 +421,12 @@ class _DeviceCommandsMixin:
             # such as the name and position can still be saved.
             self._write_ok()
             return
-        if not self.bridge.set_radio_params(freq_khz * 1000, bw, sf, cr):
+        apply_async = getattr(self.bridge, "set_radio_params_async", None)
+        if inspect.iscoroutinefunction(apply_async):
+            applied = await apply_async(freq_khz * 1000, bw, sf, cr)
+        else:
+            applied = self.bridge.set_radio_params(freq_khz * 1000, bw, sf, cr)
+        if not applied:
             self._write_err(ERR_CODE_BAD_STATE)
             return
         # Firmware persists client_repeat alongside the radio params (0 when the

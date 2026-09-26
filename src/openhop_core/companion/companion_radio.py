@@ -11,7 +11,6 @@ from __future__ import annotations
 
 import asyncio
 import logging
-import time
 from typing import Any, Iterable, Optional
 
 from ..node.node import MeshNode
@@ -198,19 +197,6 @@ class CompanionRadio(CompanionBase):
         self.node.dispatcher.set_client_repeat_enabled(bool(self.prefs.client_repeat))
         self._apply_multi_acks_pref()
 
-    def _radio_tx_busy(self) -> bool:
-        lock = getattr(self._radio, "_tx_lock", None)
-        return bool(lock is not None and lock.locked())
-
-    async def _apply_staged_radio_params_when_idle(self, timeout: float = 10.0) -> None:
-        deadline = time.monotonic() + timeout
-        while self._radio_tx_busy():
-            if time.monotonic() > deadline:
-                logger.error("Stored radio params not applied: TX still busy after %.0fs", timeout)
-                return
-            await asyncio.sleep(0.05)
-        self._apply_staged_radio_params()
-
     def _radio_has_lbt(self) -> bool:
         return hasattr(self._radio, "lbt_enabled")
 
@@ -256,25 +242,13 @@ class CompanionRadio(CompanionBase):
         configure = getattr(self._radio, "configure_radio", None)
         if not callable(configure):
             return
-        if self._radio_tx_busy():
-            # configure_radio waits for the TX lock synchronously, which would
-            # stall the event loop -- and the TX holding it -- for its whole
-            # timeout. Wait on the loop instead, then retune.
-            try:
-                asyncio.get_running_loop()
-            except RuntimeError:
-                pass
-            else:
-                self._spawn_background_task(
-                    self._apply_staged_radio_params_when_idle(), "staged radio params"
-                )
-                return
         params = {
             "frequency": stored["frequency_hz"],
             "bandwidth": stored["bandwidth_hz"],
             "spreading_factor": stored["spreading_factor"],
             "coding_rate": stored["coding_rate"],
         }
+        previous = self._live_radio_prefs
         try:
             applied = configure(**params)
         except Exception as e:
@@ -282,6 +256,7 @@ class CompanionRadio(CompanionBase):
             return
         if applied is not False:
             self._live_radio_prefs = stored
+            self._follow_queued_retune(previous)
 
     async def stop(self) -> None:
         self._running = False
@@ -418,11 +393,12 @@ class CompanionRadio(CompanionBase):
         return super().get_max_tx_power_dbm()
 
     def set_radio_params(self, freq_hz: int, bw_hz: int, sf: int, cr: int) -> bool:
-        """Apply parameters to owned hardware before persisting the change."""
-        if not (5 <= sf <= 12):
-            raise ValueError(f"Spreading factor out of range: {sf}")
-        if not (5 <= cr <= 8):
-            raise ValueError(f"Coding rate out of range: {cr}")
+        """Apply parameters to owned hardware before persisting the change.
+
+        From a coroutine prefer :meth:`set_radio_params_async`: during a TX the
+        synchronous backend call can only queue the retune, not confirm it.
+        """
+        self._check_radio_params(sf, cr)
         configure = getattr(self._radio, "configure_radio", None)
         if not callable(configure):
             return False
@@ -436,14 +412,64 @@ class CompanionRadio(CompanionBase):
         except Exception as e:
             logger.error("Error configuring radio: %s", e)
             return False
+        return self._radio_params_applied(applied, freq_hz, bw_hz, sf, cr)
+
+    async def set_radio_params_async(self, freq_hz: int, bw_hz: int, sf: int, cr: int) -> bool:
+        """Like :meth:`set_radio_params`, but awaits an in-flight TX so the
+        result says whether the radio was actually retuned."""
+        self._check_radio_params(sf, cr)
+        configure_async = getattr(self._radio, "configure_radio_async", None)
+        if not callable(configure_async):
+            return self.set_radio_params(freq_hz, bw_hz, sf, cr)
+        try:
+            applied = await configure_async(
+                frequency=freq_hz,
+                bandwidth=bw_hz,
+                spreading_factor=sf,
+                coding_rate=cr,
+            )
+        except Exception as e:
+            logger.error("Error configuring radio: %s", e)
+            return False
+        return self._radio_params_applied(applied, freq_hz, bw_hz, sf, cr, may_be_queued=False)
+
+    @staticmethod
+    def _check_radio_params(sf: int, cr: int) -> None:
+        if not (5 <= sf <= 12):
+            raise ValueError(f"Spreading factor out of range: {sf}")
+        if not (5 <= cr <= 8):
+            raise ValueError(f"Coding rate out of range: {cr}")
+
+    def _follow_queued_retune(self, previous: dict) -> None:
+        """The backend accepted the retune but queued it behind a TX. If it
+        then fails, stop treating the new params as live, so the next start or
+        reboot tries them again instead of prefs and radio drifting apart."""
+        pending = getattr(self._radio, "pending_configure", None)
+        if pending is None or pending.done():
+            return
+
+        def _done(task) -> None:
+            if task.cancelled():
+                return  # superseded by a newer reconfigure, which owns the state
+            if task.exception() is not None or task.result() is not True:
+                self._live_radio_prefs = previous
+
+        pending.add_done_callback(_done)
+
+    def _radio_params_applied(
+        self, applied, freq_hz: int, bw_hz: int, sf: int, cr: int, may_be_queued: bool = True
+    ) -> bool:
         if applied is False:
             return False
+        previous = self._live_radio_prefs
         self._live_radio_prefs = {
             "frequency_hz": freq_hz,
             "bandwidth_hz": bw_hz,
             "spreading_factor": sf,
             "coding_rate": cr,
         }
+        if may_be_queued:
+            self._follow_queued_retune(previous)
         return super().set_radio_params(freq_hz, bw_hz, sf, cr)
 
     def set_tx_power(self, power_dbm: int) -> bool:
