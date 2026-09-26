@@ -374,3 +374,40 @@ async def test_a_reboot_retune_that_failed_is_retried_on_the_next_reboot(radio):
     comp.cli.handle("reboot")
 
     assert _retuned_to(radio) == [869618000]
+
+
+async def test_an_awaited_reconfigure_supersedes_a_queued_one(radio):
+    """The frame command awaits configure_radio_async; a retune queued earlier
+    by a sync caller must not land after it and undo it."""
+    await radio._tx_lock.acquire()
+    radio.configure_radio(frequency=868000000)  # queued behind the TX
+    queued = radio.pending_configure
+    newer = asyncio.create_task(radio.configure_radio_async(frequency=869618000))
+    await asyncio.sleep(0)
+    radio._tx_lock.release()
+
+    assert await newer is True
+    await asyncio.sleep(0)
+    assert queued.cancelled()
+    assert _retuned_to(radio) == [869618000]
+    assert radio.frequency == 869618000
+
+
+async def test_a_failed_superseding_retune_leaves_the_last_confirmed_params_live(radio):
+    """915 running; 868 queued, superseded by 869, and the TX outlasts the wait.
+    Neither was applied, so neither may count as live: staging 868 and
+    rebooting must still retune."""
+    radio.CONFIGURE_TX_WAIT_SECONDS = 0.05
+    comp = CompanionRadio(radio, LocalIdentity())
+    await radio._tx_lock.acquire()
+    comp.set_radio_params(868000000, 250000, 7, 5)
+    comp.set_radio_params(869000000, 250000, 7, 5)
+    await asyncio.sleep(0.2)
+    radio._tx_lock.release()
+    assert _retuned_to(radio) == []
+    assert comp._live_radio_prefs["frequency_hz"] == 915000000
+
+    comp.cli.handle("set radio 868.0,250,7,5")
+    comp.cli.handle("reboot")
+
+    assert _retuned_to(radio) == [868000000]

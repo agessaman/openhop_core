@@ -248,15 +248,13 @@ class CompanionRadio(CompanionBase):
             "spreading_factor": stored["spreading_factor"],
             "coding_rate": stored["coding_rate"],
         }
-        previous = self._live_radio_prefs
         try:
             applied = configure(**params)
         except Exception as e:
             logger.error("Error applying stored radio params: %s", e)
             return
         if applied is not False:
-            self._live_radio_prefs = stored
-            self._follow_queued_retune(previous)
+            self._note_radio_params_live(stored)
 
     async def stop(self) -> None:
         self._running = False
@@ -440,19 +438,22 @@ class CompanionRadio(CompanionBase):
         if not (5 <= cr <= 8):
             raise ValueError(f"Coding rate out of range: {cr}")
 
-    def _follow_queued_retune(self, previous: dict) -> None:
-        """The backend accepted the retune but queued it behind a TX. If it
-        then fails, stop treating the new params as live, so the next start or
-        reboot tries them again instead of prefs and radio drifting apart."""
-        pending = getattr(self._radio, "pending_configure", None)
+    def _note_radio_params_live(self, params: dict, may_be_queued: bool = True) -> None:
+        """Record ``params`` as what the radio runs -- only once it does.
+
+        A backend may accept a retune but queue it behind a TX
+        (``pending_configure``). Then the params become live only if that
+        retune succeeds; a failed or superseded one leaves the last confirmed
+        state, so a later start or reboot retries instead of skipping.
+        """
+        pending = getattr(self._radio, "pending_configure", None) if may_be_queued else None
         if pending is None or pending.done():
+            self._live_radio_prefs = dict(params)
             return
 
         def _done(task) -> None:
-            if task.cancelled():
-                return  # superseded by a newer reconfigure, which owns the state
-            if task.exception() is not None or task.result() is not True:
-                self._live_radio_prefs = previous
+            if not task.cancelled() and task.exception() is None and task.result() is True:
+                self._live_radio_prefs = dict(params)
 
         pending.add_done_callback(_done)
 
@@ -461,15 +462,15 @@ class CompanionRadio(CompanionBase):
     ) -> bool:
         if applied is False:
             return False
-        previous = self._live_radio_prefs
-        self._live_radio_prefs = {
-            "frequency_hz": freq_hz,
-            "bandwidth_hz": bw_hz,
-            "spreading_factor": sf,
-            "coding_rate": cr,
-        }
-        if may_be_queued:
-            self._follow_queued_retune(previous)
+        self._note_radio_params_live(
+            {
+                "frequency_hz": freq_hz,
+                "bandwidth_hz": bw_hz,
+                "spreading_factor": sf,
+                "coding_rate": cr,
+            },
+            may_be_queued=may_be_queued,
+        )
         return super().set_radio_params(freq_hz, bw_hz, sf, cr)
 
     def set_tx_power(self, power_dbm: int) -> bool:

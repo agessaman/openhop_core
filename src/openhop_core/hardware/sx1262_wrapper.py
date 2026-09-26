@@ -1764,6 +1764,7 @@ class SX1262Radio(LoRaRadio):
                 task_loop.call_soon_threadsafe(pending.cancel)
         except RuntimeError as e:  # its loop is already closed
             logger.debug("Could not cancel queued radio reconfigure: %s", e)
+            pending.get_coro().close()  # it will never run; don't leave it unawaited
 
     def _on_queued_configure_done(self, task: asyncio.Task) -> None:
         if getattr(self, "_pending_configure", None) is task:
@@ -1794,6 +1795,10 @@ class SX1262Radio(LoRaRadio):
         if not self._initialized or self.lora is None:
             logger.error("Cannot configure radio: not initialised")
             return False
+        # A direct call is a newer request than any retune still queued behind
+        # the TX (that queued task is itself a call to this method).
+        if self._pending_configure is not asyncio.current_task():
+            self._supersede_pending_configure()
         try:
             await asyncio.wait_for(self._tx_lock.acquire(), timeout=self.CONFIGURE_TX_WAIT_SECONDS)
         except asyncio.TimeoutError:
@@ -1858,15 +1863,18 @@ class SX1262Radio(LoRaRadio):
             return True
 
         if loop is not None and loop.is_running():
+            coro = self.configure_radio_async(*params)
             try:
-                future = asyncio.run_coroutine_threadsafe(self.configure_radio_async(*params), loop)
+                future = asyncio.run_coroutine_threadsafe(coro, loop)
+            except RuntimeError as e:  # the loop closed under us
+                coro.close()
+                logger.error("configure_radio: radio event loop unavailable: %s", e)
+                return False
+            try:
                 return future.result(timeout=self.CONFIGURE_TX_WAIT_SECONDS + 2.0)
             except concurrent.futures.TimeoutError:
                 future.cancel()
                 logger.error("configure_radio: timed out waiting for the radio's event loop")
-                return False
-            except RuntimeError as e:  # the loop closed under us
-                logger.error("configure_radio: radio event loop unavailable: %s", e)
                 return False
 
         # No loop anywhere: nothing can be holding the asyncio TX lock.
