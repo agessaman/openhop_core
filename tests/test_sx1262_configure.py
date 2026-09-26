@@ -32,13 +32,14 @@ def _reset_singleton():
     SX1262Radio._active_instances = set()
 
 
-def _build_radio() -> SX1262Radio:
+def _build_radio(**kwargs) -> SX1262Radio:
     mock_gpio = _make_mock_gpio()
+    params = {"radio_timing_delay": 0.0, "frequency": 915000000, "bandwidth": 250000, **kwargs}
     with (
         patch("openhop_core.hardware.sx1262_wrapper.GPIOPinManager", return_value=mock_gpio),
         patch("openhop_core.hardware.sx1262_wrapper.set_gpio_manager"),
     ):
-        r = SX1262Radio(radio_timing_delay=0.0, frequency=915000000, bandwidth=250000)
+        r = SX1262Radio(**params)
     r.lora = _make_mock_lora()
     r._initialized = True
     r._interrupt_setup = True
@@ -405,9 +406,63 @@ async def test_a_failed_superseding_retune_leaves_the_last_confirmed_params_live
     await asyncio.sleep(0.2)
     radio._tx_lock.release()
     assert _retuned_to(radio) == []
-    assert comp._live_radio_prefs["frequency_hz"] == 915000000
+    assert comp._running_radio_params()["frequency_hz"] == 915000000
 
     comp.cli.handle("set radio 868.0,250,7,5")
     comp.cli.handle("reboot")
 
     assert _retuned_to(radio) == [868000000]
+
+
+async def test_rebooting_back_to_the_live_params_cancels_a_queued_retune():
+    """915 live, 868 queued behind a TX, then the stored params go back to 915
+    and the companion reboots before the TX ends: 868 must not land later."""
+    radio = _build_radio(spreading_factor=10, coding_rate=5)
+    radio._event_loop = asyncio.get_running_loop()
+    comp = CompanionRadio(radio, LocalIdentity())
+    await radio._tx_lock.acquire()
+    radio.configure_radio(frequency=868000000)  # queued
+    queued = radio.pending_configure
+
+    comp.cli.handle("set radio 915.0,250,10,5")  # what the radio already runs
+    comp.cli.handle("reboot")
+    radio._tx_lock.release()
+    await asyncio.sleep(0.05)
+
+    assert queued.cancelled()
+    assert radio.frequency == 915000000
+    assert 868000000 not in _retuned_to(radio)
+
+
+async def test_live_params_follow_the_radio_not_the_order_retunes_complete(radio):
+    """A queued 868 finishes, then a newer 869 is applied. Staging 868 and
+    rebooting must retune: the radio is on 869, whatever finished first."""
+    comp = CompanionRadio(radio, LocalIdentity())
+    await radio._tx_lock.acquire()
+    comp.set_radio_params(868000000, 250000, 7, 5)  # queued
+    radio._tx_lock.release()
+    await radio.pending_configure
+    comp.set_radio_params(869000000, 250000, 7, 5)  # idle: applied at once
+    assert radio.frequency == 869000000
+
+    comp.cli.handle("set radio 868.0,250,7,5")
+    comp.cli.handle("reboot")
+
+    assert radio.frequency == 868000000
+
+
+def test_a_companion_without_radio_config_reports_and_keeps_the_radios_params():
+    """Built from the radio's own kwargs (radio_config omitted), the companion
+    must report the radio's real params and start() must not retune it."""
+    radio = _build_radio()
+    comp = CompanionRadio(radio, LocalIdentity())
+    prefs = comp.get_self_info()
+    assert (prefs.frequency_hz, prefs.bandwidth_hz) == (915000000, 250000)
+    assert (prefs.spreading_factor, prefs.coding_rate) == (
+        radio.spreading_factor,
+        radio.coding_rate,
+    )
+
+    comp._apply_staged_radio_params()
+
+    assert _retuned_to(radio) == []

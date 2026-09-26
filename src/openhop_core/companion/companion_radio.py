@@ -76,6 +76,9 @@ class CompanionRadio(CompanionBase):
         initial_contacts: Optional[Iterable[Any]] = None,
     ) -> None:
         """Initialise the companion radio."""
+        # Set before the stores: prefs are seeded from the radio's own params
+        # where radio_config is silent (see _configured_radio_prefs).
+        self._radio = radio
         self._init_companion_stores(
             identity=identity,
             node_name=node_name,
@@ -86,11 +89,10 @@ class CompanionRadio(CompanionBase):
             radio_config=radio_config,
             initial_contacts=initial_contacts,
         )
-        self._radio = radio
         self._dispatcher_task: Optional[asyncio.Task] = None
-        # The radio prefs the hardware is running on: what radio_config set up,
-        # then whatever this companion applies. Kept apart from radio_config,
-        # which is the host's dict.
+        # Last radio params this companion applied, for a backend that doesn't
+        # report its own (see _running_radio_params). Kept apart from
+        # radio_config, which is the host's dict.
         self._live_radio_prefs = self._configured_radio_prefs()
 
         self.node = MeshNode(
@@ -237,7 +239,10 @@ class CompanionRadio(CompanionBase):
         apply").
         """
         stored = {field: getattr(self.prefs, field) for field in self._live_radio_prefs}
-        if stored == self._live_radio_prefs:
+        pending = getattr(self._radio, "pending_configure", None)
+        # A retune still queued behind a TX is not what the radio runs: issue
+        # the stored params anyway, which supersedes it.
+        if stored == self._running_radio_params() and (pending is None or pending.done()):
             return
         configure = getattr(self._radio, "configure_radio", None)
         if not callable(configure):
@@ -254,7 +259,7 @@ class CompanionRadio(CompanionBase):
             logger.error("Error applying stored radio params: %s", e)
             return
         if applied is not False:
-            self._note_radio_params_live(stored)
+            self._live_radio_prefs = stored
 
     async def stop(self) -> None:
         self._running = False
@@ -429,7 +434,7 @@ class CompanionRadio(CompanionBase):
         except Exception as e:
             logger.error("Error configuring radio: %s", e)
             return False
-        return self._radio_params_applied(applied, freq_hz, bw_hz, sf, cr, may_be_queued=False)
+        return self._radio_params_applied(applied, freq_hz, bw_hz, sf, cr)
 
     @staticmethod
     def _check_radio_params(sf: int, cr: int) -> None:
@@ -438,39 +443,43 @@ class CompanionRadio(CompanionBase):
         if not (5 <= cr <= 8):
             raise ValueError(f"Coding rate out of range: {cr}")
 
-    def _note_radio_params_live(self, params: dict, may_be_queued: bool = True) -> None:
-        """Record ``params`` as what the radio runs -- only once it does.
+    _RADIO_PARAM_ATTRS = (
+        ("frequency_hz", "frequency"),
+        ("bandwidth_hz", "bandwidth"),
+        ("spreading_factor", "spreading_factor"),
+        ("coding_rate", "coding_rate"),
+    )
 
-        A backend may accept a retune but queue it behind a TX
-        (``pending_configure``). Then the params become live only if that
-        retune succeeds; a failed or superseded one leaves the last confirmed
-        state, so a later start or reboot retries instead of skipping.
-        """
-        pending = getattr(self._radio, "pending_configure", None) if may_be_queued else None
-        if pending is None or pending.done():
-            self._live_radio_prefs = dict(params)
-            return
+    def _configured_radio_prefs(self) -> dict:
+        """Where radio_config is silent, the radio's own params rather than
+        generic defaults: the backend was built with them, so seeding prefs
+        from a default like 915 MHz would report the wrong radio to the app
+        and have start() retune it there."""
+        prefs = super()._configured_radio_prefs()
+        radio = getattr(self, "_radio", None)
+        for pref, attr in self._RADIO_PARAM_ATTRS:
+            if attr not in self._radio_config and hasattr(radio, attr):
+                prefs[pref] = getattr(radio, attr)
+        return prefs
 
-        def _done(task) -> None:
-            if not task.cancelled() and task.exception() is None and task.result() is True:
-                self._live_radio_prefs = dict(params)
+    def _running_radio_params(self) -> dict:
+        """The radio params the hardware is actually on. Backends report them
+        (updated only when a retune is applied), so a queued or failed retune
+        can never be mistaken for live. A backend that doesn't falls back to
+        the last params this companion applied."""
+        if all(hasattr(self._radio, attr) for _, attr in self._RADIO_PARAM_ATTRS):
+            return {pref: getattr(self._radio, attr) for pref, attr in self._RADIO_PARAM_ATTRS}
+        return dict(self._live_radio_prefs)
 
-        pending.add_done_callback(_done)
-
-    def _radio_params_applied(
-        self, applied, freq_hz: int, bw_hz: int, sf: int, cr: int, may_be_queued: bool = True
-    ) -> bool:
+    def _radio_params_applied(self, applied, freq_hz: int, bw_hz: int, sf: int, cr: int) -> bool:
         if applied is False:
             return False
-        self._note_radio_params_live(
-            {
-                "frequency_hz": freq_hz,
-                "bandwidth_hz": bw_hz,
-                "spreading_factor": sf,
-                "coding_rate": cr,
-            },
-            may_be_queued=may_be_queued,
-        )
+        self._live_radio_prefs = {
+            "frequency_hz": freq_hz,
+            "bandwidth_hz": bw_hz,
+            "spreading_factor": sf,
+            "coding_rate": cr,
+        }
         return super().set_radio_params(freq_hz, bw_hz, sf, cr)
 
     def set_tx_power(self, power_dbm: int) -> bool:
