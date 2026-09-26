@@ -90,6 +90,7 @@ class SX1262Radio(LoRaRadio):
         lbt_max_wait_seconds: float = 4.0,
         lbt_retry_interval_ms: int = 200,
         radio_timing_delay: float = RADIO_TIMING_DELAY,
+        lbt_enabled: bool = True,
         spi_transport=None,
         gpio_manager=None,
     ):
@@ -230,6 +231,9 @@ class SX1262Radio(LoRaRadio):
         # 200 ms retry); the jitter keeps two nodes' checks decorrelated.
         self.lbt_max_wait_seconds = max(0.5, float(lbt_max_wait_seconds))
         self.lbt_retry_interval_ms = max(20, int(lbt_retry_interval_ms))
+        # Off skips the channel check entirely (MeshCore getCADEnabled() false),
+        # as usb_radio / tcp_radio / kiss_modem_wrapper already allow.
+        self.lbt_enabled = bool(lbt_enabled)
 
         # Reception-in-progress markers (parity with MeshCore
         # CustomSX1262::isReceiving()). The interrupt handler clears the
@@ -1166,9 +1170,9 @@ class SX1262Radio(LoRaRadio):
         lbt_started = time.monotonic()
         latch_defers = 0
         cad_checks = 0
-        outcome = "forced"
+        outcome = "forced" if self.lbt_enabled else "off"
 
-        while True:
+        while self.lbt_enabled:
             scanned = False
             try:
                 # Passive check first: a latched in-progress reception is
