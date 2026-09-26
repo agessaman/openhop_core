@@ -11,6 +11,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import time
 from typing import Any, Iterable, Optional
 
 from ..node.node import MeshNode
@@ -88,6 +89,10 @@ class CompanionRadio(CompanionBase):
         )
         self._radio = radio
         self._dispatcher_task: Optional[asyncio.Task] = None
+        # The radio prefs the hardware is running on: what radio_config set up,
+        # then whatever this companion applies. Kept apart from radio_config,
+        # which is the host's dict.
+        self._live_radio_prefs = self._configured_radio_prefs()
 
         self.node = MeshNode(
             radio=radio,
@@ -144,21 +149,9 @@ class CompanionRadio(CompanionBase):
         if self._running:
             logger.warning("CompanionRadio already running")
             return
+        self._remote_cli_closed = False
         self._running = True
-        self.node.dispatcher.set_default_path_hash_mode(self.prefs.path_hash_mode)
-        self.node.dispatcher.rx_delay_base = self.prefs.rx_delay_base
-        # Seed the flood-scope mirrors from persisted prefs at boot: the
-        # default, the transient override and the sticky unscoped flag. Without
-        # this, a companion booted with only a persisted default would send every
-        # dispatcher-scoped packet as plain flood until the first set_* call.
-        self.node.dispatcher.default_flood_transport_key = self._default_scope_key()
-        self.node.dispatcher.flood_transport_key = self._flood_transport_key
-        self.node.dispatcher.flood_unscoped = self._flood_unscoped
-        # Sync the airtime budget factor before arming the bucket so the initial
-        # duty cycle is correct when client-repeat starts enabled.
-        self.node.dispatcher.airtime_budget_factor = self.prefs.airtime_factor
-        self.node.dispatcher.set_client_repeat_enabled(bool(self.prefs.client_repeat))
-        self._apply_multi_acks_pref()
+        self._apply_prefs_to_runtime()
         self._dispatcher_task = asyncio.create_task(self.node.start())
         # Wait until the dispatcher loop is active so a following stop() cannot
         # lose a race where run_forever clears the stop event before starting.
@@ -185,8 +178,114 @@ class CompanionRadio(CompanionBase):
             self._identity.get_public_key().hex()[:16],
         )
 
+    def _apply_prefs_to_runtime(self) -> None:
+        """Push prefs into the radio and dispatcher: at start, and again when a
+        `reboot` reloads them."""
+        self._apply_staged_radio_params()
+        self._apply_cad_pref()
+        self.node.dispatcher.set_default_path_hash_mode(self.prefs.path_hash_mode)
+        self.node.dispatcher.rx_delay_base = self.prefs.rx_delay_base
+        # Seed the flood-scope mirrors from persisted prefs at boot: the
+        # default, the transient override and the sticky unscoped flag. Without
+        # this, a companion booted with only a persisted default would send every
+        # dispatcher-scoped packet as plain flood until the first set_* call.
+        self.node.dispatcher.default_flood_transport_key = self._default_scope_key()
+        self.node.dispatcher.flood_transport_key = self._flood_transport_key
+        self.node.dispatcher.flood_unscoped = self._flood_unscoped
+        # Sync the airtime budget factor before arming the bucket so the initial
+        # duty cycle is correct when client-repeat starts enabled.
+        self.node.dispatcher.airtime_budget_factor = self.prefs.airtime_factor
+        self.node.dispatcher.set_client_repeat_enabled(bool(self.prefs.client_repeat))
+        self._apply_multi_acks_pref()
+
+    def _radio_tx_busy(self) -> bool:
+        lock = getattr(self._radio, "_tx_lock", None)
+        return bool(lock is not None and lock.locked())
+
+    async def _apply_staged_radio_params_when_idle(self, timeout: float = 10.0) -> None:
+        deadline = time.monotonic() + timeout
+        while self._radio_tx_busy():
+            if time.monotonic() > deadline:
+                logger.error("Stored radio params not applied: TX still busy after %.0fs", timeout)
+                return
+            await asyncio.sleep(0.05)
+        self._apply_staged_radio_params()
+
+    def _radio_has_lbt(self) -> bool:
+        return hasattr(self._radio, "lbt_enabled")
+
+    def get_cad_enabled(self) -> Optional[bool]:
+        """The stored ``cad`` pref, else the radio's configured LBT mode."""
+        if not self._radio_has_lbt():
+            return None
+        if self.prefs.cad_enabled is not None:
+            return bool(self.prefs.cad_enabled)
+        return bool(self._radio.lbt_enabled)
+
+    def set_cad_enabled(self, enabled: bool) -> bool:
+        """Store and apply listen-before-talk on the owned radio."""
+        if not self._radio_has_lbt():
+            return False
+        self.prefs.cad_enabled = bool(enabled)
+        self._save_prefs()
+        self._apply_cad_pref()
+        return True
+
+    def _apply_cad_pref(self) -> None:
+        # Until someone sets `cad`, the radio keeps the LBT mode it was built with.
+        if self.prefs.cad_enabled is None or not self._radio_has_lbt():
+            return
+        setter = getattr(self._radio, "set_lbt_enabled", None)
+        if callable(setter):
+            setter(bool(self.prefs.cad_enabled))
+        else:
+            self._radio.lbt_enabled = bool(self.prefs.cad_enabled)
+
+    def _apply_staged_radio_params(self) -> None:
+        """Bring the radio up on the stored radio prefs, as firmware does at boot
+        (``radio_driver.setParams(_prefs.freq, ...)``).
+
+        Does nothing unless the stored prefs differ from what the radio is
+        running on: a persistence layer's ``_load_prefs`` restored other
+        values, or the CLI's ``set radio`` staged some ("OK - reboot to
+        apply").
+        """
+        stored = {field: getattr(self.prefs, field) for field in self._live_radio_prefs}
+        if stored == self._live_radio_prefs:
+            return
+        configure = getattr(self._radio, "configure_radio", None)
+        if not callable(configure):
+            return
+        if self._radio_tx_busy():
+            # configure_radio waits for the TX lock synchronously, which would
+            # stall the event loop -- and the TX holding it -- for its whole
+            # timeout. Wait on the loop instead, then retune.
+            try:
+                asyncio.get_running_loop()
+            except RuntimeError:
+                pass
+            else:
+                self._spawn_background_task(
+                    self._apply_staged_radio_params_when_idle(), "staged radio params"
+                )
+                return
+        params = {
+            "frequency": stored["frequency_hz"],
+            "bandwidth": stored["bandwidth_hz"],
+            "spreading_factor": stored["spreading_factor"],
+            "coding_rate": stored["coding_rate"],
+        }
+        try:
+            applied = configure(**params)
+        except Exception as e:
+            logger.error("Error applying stored radio params: %s", e)
+            return
+        if applied is not False:
+            self._live_radio_prefs = stored
+
     async def stop(self) -> None:
         self._running = False
+        self._cancel_remote_cli_replies()
         self._clear_pending_frame_logins()
         try:
             self.node.dispatcher.remove_raw_packet_subscriber(self._on_raw_packet_rx_log)
@@ -339,6 +438,12 @@ class CompanionRadio(CompanionBase):
             return False
         if applied is False:
             return False
+        self._live_radio_prefs = {
+            "frequency_hz": freq_hz,
+            "bandwidth_hz": bw_hz,
+            "spreading_factor": sf,
+            "coding_rate": cr,
+        }
         return super().set_radio_params(freq_hz, bw_hz, sf, cr)
 
     def set_tx_power(self, power_dbm: int) -> bool:

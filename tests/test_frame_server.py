@@ -1602,11 +1602,11 @@ def test_parse_binary_response_anon_not_mistaken_for_owner_info():
     assert "owner_info" not in parsed
 
 
-def test_device_info_reports_firmware_ver_code_13():
-    """Companion advertises FIRMWARE_VER_CODE 13 (PR #2672 non-contact anon requests)."""
+def test_device_info_reports_firmware_ver_code_14():
+    """Companion advertises FIRMWARE_VER_CODE 14 (CMD_RUN_CLI_COMMAND / RESP_CODE_CLI_REPLY)."""
     from openhop_core.companion.constants import FIRMWARE_VER_CODE
 
-    assert FIRMWARE_VER_CODE == 13
+    assert FIRMWARE_VER_CODE == 14
 
 
 class _MockBridgeAnonReq:
