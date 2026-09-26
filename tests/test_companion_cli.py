@@ -14,6 +14,8 @@ from unittest.mock import AsyncMock, Mock, patch
 
 import pytest
 
+import openhop_core
+
 from openhop_core.companion import CompanionBridge, CompanionRadio
 from openhop_core.companion.cli import (
     MAX_CLI_REPLY_LEN,
@@ -226,11 +228,23 @@ class TestCompanionCLITimezone:
 
 
 class TestCompanionCLIDeviceInfo:
-    def test_board_and_ver_reflect_set_device_info(self):
+    def test_board_reflects_set_device_info(self):
         cli = CompanionCLI(_make_bridge())
-        cli.set_device_info("pyMC-Radio", "14.0", "2026-09-25")
+        cli.set_device_info("pyMC-Radio")
         assert cli.handle("board") == "pyMC-Radio"
-        assert cli.handle("ver") == "14.0 (Build: 2026-09-25)"
+
+    def test_ver_reports_the_openhop_core_version(self):
+        """A companion is openHop software: `ver` names its versions, not the
+        protocol level or a firmware build date."""
+        assert _make_bridge().cli.handle("ver") == f"openHop core v{openhop_core.__version__}"
+
+    def test_a_host_adds_its_own_version_ahead_of_the_core(self):
+        cli = _make_bridge().cli
+        cli.add_software_version("repeater", "1.0.11")
+        assert cli.handle("ver") == f"openHop repeater v1.0.11, core v{openhop_core.__version__}"
+        cli.add_software_version("repeater", "1.0.12")  # replaced, not duplicated
+        assert cli.handle("ver") == f"openHop repeater v1.0.12, core v{openhop_core.__version__}"
+        assert cli.handle("ab|ver").startswith("ab|openHop repeater v1.0.12")
 
 
 # ---------------------------------------------------------------------------
@@ -647,22 +661,22 @@ class TestFrameServerRunCLICommand:
 
     @pytest.mark.asyncio
     async def test_constructor_feeds_its_device_info_to_the_cli(self):
-        """`board` and `ver` must answer what DEVICE_INFO reports."""
+        """`board` must answer what DEVICE_INFO reports; `ver` keeps naming the
+        openHop versions, not DEVICE_INFO's protocol-level string."""
         bridge = _make_bridge()
         _capture_server(bridge, device_model="pyMC-Unit", build_date="2026-09-25")
 
         assert bridge.cli.handle("board") == "pyMC-Unit"
-        assert bridge.cli.handle("ver") == f"{FIRMWARE_VER_CODE}.0 (Build: 2026-09-25)"
+        assert bridge.cli.handle("ver") == f"openHop core v{openhop_core.__version__}"
 
     @pytest.mark.asyncio
     async def test_cli_device_info_is_truncated_like_device_info(self):
-        """DEVICE_INFO carries a 40-byte model and a 12-byte build date; the CLI
-        must not report a longer name than the app was sent."""
+        """DEVICE_INFO carries a 40-byte model; the CLI must not report a
+        longer name than the app was sent."""
         bridge = _make_bridge()
-        _capture_server(bridge, device_model="M" * 50, build_date="D" * 20)
+        _capture_server(bridge, device_model="M" * 50)
 
         assert bridge.cli.handle("board") == "M" * 40
-        assert bridge.cli.handle("ver") == f"{FIRMWARE_VER_CODE}.0 (Build: {'D' * 12})"
 
 
 # ---------------------------------------------------------------------------
@@ -2094,25 +2108,20 @@ class TestCompanionCLIHookFailure:
 
 class TestCompanionCLIDefaultDeviceInfo:
     def test_board_and_ver_answer_the_python_companion_defaults(self):
-        """Firmware answers ``board.getManufacturerName()`` and
-        ``FIRMWARE_VERSION (Build: FIRMWARE_BUILD_DATE)`` (MyMesh.cpp:2171-2179).
+        """Firmware answers ``board.getManufacturerName()`` (MyMesh.cpp:2171).
         With no frame server there is no DEVICE_INFO to copy, so the CLI must
-        still answer with its own defaults rather than empty strings.
+        still answer with its own default rather than an empty string.
         """
         bridge = _make_bridge()
         assert bridge.cli.manufacturer == "pyMC-Companion"
-        assert bridge.cli.version == ""
-        assert bridge.cli.build_date == ""
-
         assert bridge.cli.handle("board") == "pyMC-Companion"
-        assert bridge.cli.handle("ver") == " (Build: )"
+        assert bridge.cli.handle("ver") == f"openHop core v{openhop_core.__version__}"
 
     def test_a_frame_server_still_overrides_the_defaults(self):
         bridge = _make_bridge()
         _capture_server(bridge, device_model="pyMC-Bridge", build_date="2026-09-25")
 
         assert bridge.cli.handle("board") == "pyMC-Bridge"
-        assert bridge.cli.handle("ver") == f"{FIRMWARE_VER_CODE}.0 (Build: 2026-09-25)"
 
 
 @pytest.mark.parametrize("value", [1e39, -1e39, float("inf"), float("nan")])

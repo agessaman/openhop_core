@@ -19,6 +19,8 @@ import re
 import struct
 from typing import TYPE_CHECKING, Callable, Optional
 
+from .. import __version__ as core_version
+
 if TYPE_CHECKING:
     from .companion_base import CompanionBase
 
@@ -163,8 +165,9 @@ class CompanionCLI:
         # device info at construction so both answer what DEVICE_INFO says.
         self._rebooted = False
         self.manufacturer = "pyMC-Companion"
-        self.version = ""
-        self.build_date = ""
+        # Reported by `ver`, host first, core last. A host (e.g. the repeater)
+        # adds its own entry with add_software_version().
+        self._software_versions: list[tuple[str, str]] = [("core", core_version)]
 
     @property
     def last_command_rebooted(self) -> bool:
@@ -172,10 +175,22 @@ class CompanionCLI:
         whose reply firmware never sends."""
         return self._rebooted
 
-    def set_device_info(self, manufacturer: str, version: str, build_date: str) -> None:
+    def set_device_info(self, manufacturer: str) -> None:
+        """`board` answers what DEVICE_INFO reports as the manufacturer."""
         self.manufacturer = manufacturer
-        self.version = version
-        self.build_date = build_date
+
+    def add_software_version(self, name: str, version: str) -> None:
+        """Report ``name`` (e.g. "repeater") in `ver`, ahead of the core."""
+        self._software_versions = [(n, v) for n, v in self._software_versions if n != name]
+        self._software_versions.insert(0, (name, version))
+
+    @property
+    def version_text(self) -> str:
+        """`ver`: the openHop software running this companion, e.g.
+        "openHop repeater v1.0.11, core v1.1.4". Firmware answers
+        "<FIRMWARE_VERSION> (Build: <date>)"; a companion is openHop software,
+        so it names those versions instead of the protocol level."""
+        return "openHop " + ", ".join(f"{name} v{ver}" for name, ver in self._software_versions)
 
     def handle(self, command: str, sender_timestamp: int = 0) -> str:
         """Run ``command`` and return the reply (never empty for a known command)."""
@@ -368,7 +383,7 @@ class CompanionCLI:
         if command == "board":
             return self.manufacturer
         if command == "ver":
-            return f"{self.version} (Build: {self.build_date})"
+            return self.version_text
 
         if command == "get tz.offset":
             return f"> {c.get_self_info().tz_offset}"

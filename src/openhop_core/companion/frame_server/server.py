@@ -219,14 +219,11 @@ class CompanionFrameServer(
             CMD_REBOOT: self._cmd_reboot,
         }
 
-        # `board` and `ver` on the companion's CLI answer what DEVICE_INFO says.
+        # `board` on the companion's CLI answers what DEVICE_INFO says.
         cli = getattr(bridge, "cli", None)
         if callable(getattr(cli, "set_device_info", None)):
             cli.set_device_info(
-                *(
-                    field.split(b"\x00", 1)[0].decode("utf-8", errors="replace")
-                    for field in (self._model_bytes, self._version_bytes, self._build_date_bytes)
-                )
+                self._model_bytes.split(b"\x00", 1)[0].decode("utf-8", errors="replace")
             )
 
     # -------------------------------------------------------------------------
