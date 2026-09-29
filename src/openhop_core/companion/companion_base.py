@@ -92,6 +92,13 @@ class CompanionBase(
         self.message_queue = MessageQueue(offline_queue_size)
         self.path_cache = PathCache()
         self.stats = StatsCollector()
+        # NODE_DISCOVERED events may be published through EventService.publish_sync(),
+        # which schedules each event in its own task. Serialize the complete advert
+        # state transition, including callbacks, so concurrent adverts cannot
+        # interleave mutations of the contact store. This orders adverts against
+        # each other only; app commands and PATH updates still mutate contacts
+        # outside it.
+        self._node_discovered_lock = asyncio.Lock()
 
         self.prefs = NodePrefs(
             node_name=node_name,

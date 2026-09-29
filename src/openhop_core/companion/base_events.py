@@ -42,55 +42,65 @@ class _RxEventsMixin:
             elif event_type == MeshEvents.CONTACT_UPDATED:
                 pass
             elif event_type == MeshEvents.NODE_DISCOVERED:
-                # Advert pipeline (single path): all adverts applied here; one event
-                # -> one store update and at most one advert_received (Bridge and Radio).
-                now = int(time.time())
-                contact = Contact.from_dict(data, now=now)
-                if contact.public_key == self.get_public_key():
-                    # Backstop: the ADVERT handler already drops a self advert the way
-                    # Mesh::onRecvPacket does (Mesh.cpp:263).  This event is a public
-                    # seam, and a node must never contact-book or path-cache itself
-                    # however the event was produced.
-                    return
-                # Wire advert flags (ADVERT_FLAG_IS_CHAT_NODE=0x01, etc.) must not
-                # be stored as local contact flags (bit 0 = favourite).  For new
-                # contacts the flags start at 0; for existing contacts
-                # _apply_advert_to_stores restores the persisted value (line 708).
-                contact.flags = 0
-                raw_blob = data.get("raw_advert_packet")
-                if isinstance(raw_blob, (bytes, bytearray)) and len(raw_blob) > 0:
-                    contact.last_advert_packet = bytes(raw_blob)
-                if len(contact.public_key) >= 7 and contact.name:
-                    # Replay protection (BaseChatMesh::onAdvertRecv): for a contact we
-                    # already know, ignore any advert whose timestamp is not strictly
-                    # newer than the stored one. This prevents a delayed or replayed
-                    # advert from overwriting newer name/location/type/app data (and
-                    # from downgrading the cached path). Matches the firmware's early
-                    # return, so no store update and no client notification fire.
-                    existing = self.contacts.get_by_key(contact.public_key)
-                    if (
-                        existing is not None
-                        and contact.last_advert_timestamp <= existing.last_advert_timestamp
-                    ):
-                        return
-                    inbound_path = data.get("inbound_path")
-                    path_len_encoded = data.get("path_len_encoded")
-                    applied = await self._apply_advert_to_stores(
-                        contact, inbound_path, path_len_encoded=path_len_encoded
-                    )
-                    if applied is not None:
-                        # Stored (existing or newly auto-added): persist + app contact update.
-                        await self._fire_callbacks("advert_received", applied)
-                    # Firmware parity (BaseChatMesh::onAdvertRecv -> onDiscoveredContact):
-                    # notify the client for *every* valid advert (stored or not). The frame
-                    # layer decides full NEW_ADVERT vs short ADVERT by whether the contact
-                    # ended up in the store.
-                    disc_contact = applied if applied is not None else contact
-                    await self._fire_callbacks("node_discovered", disc_contact)
+                async with self._node_discovered_lock:
+                    await self._handle_node_discovered(data)
             elif event_type == MeshEvents.TELEMETRY_UPDATED:
                 await self._fire_callbacks("telemetry_response", data)
         except Exception as e:
             logger.error("Error handling mesh event %s: %s", event_type, e)
+
+    async def _handle_node_discovered(self, data: dict) -> None:
+        """Apply one advert to the stores and fire its callbacks.
+
+        Callers hold ``_node_discovered_lock`` so the whole transition, callbacks
+        included, completes before the next advert touches the contact store.
+        The lock is not reentrant: a callback may schedule further advert
+        handling but must not await it, or this companion's advert pipeline
+        deadlocks.
+        """
+        # Advert pipeline (single path): all adverts applied here; one event
+        # -> one store update and at most one advert_received (Bridge and Radio).
+        now = int(time.time())
+        contact = Contact.from_dict(data, now=now)
+        if contact.public_key == self.get_public_key():
+            # Backstop: the ADVERT handler already drops a self advert the way
+            # Mesh::onRecvPacket does (Mesh.cpp:263).  This event is a public
+            # seam, and a node must never contact-book or path-cache itself
+            # however the event was produced.
+            return
+        # Wire advert flags (ADVERT_FLAG_IS_CHAT_NODE=0x01, etc.) must not
+        # be stored as local contact flags (bit 0 = favourite).  For new
+        # contacts the flags start at 0; for existing contacts
+        # _apply_advert_to_stores restores the persisted value (line 708).
+        contact.flags = 0
+        raw_blob = data.get("raw_advert_packet")
+        if isinstance(raw_blob, (bytes, bytearray)) and len(raw_blob) > 0:
+            contact.last_advert_packet = bytes(raw_blob)
+        if len(contact.public_key) < 7 or not contact.name:
+            return
+        # Replay protection (BaseChatMesh::onAdvertRecv): for a contact we
+        # already know, ignore any advert whose timestamp is not strictly
+        # newer than the stored one. This prevents a delayed or replayed
+        # advert from overwriting newer name/location/type/app data (and
+        # from downgrading the cached path). Matches the firmware's early
+        # return, so no store update and no client notification fire.
+        existing = self.contacts.get_by_key(contact.public_key)
+        if existing is not None and contact.last_advert_timestamp <= existing.last_advert_timestamp:
+            return
+        inbound_path = data.get("inbound_path")
+        path_len_encoded = data.get("path_len_encoded")
+        applied = await self._apply_advert_to_stores(
+            contact, inbound_path, path_len_encoded=path_len_encoded
+        )
+        if applied is not None:
+            # Stored (existing or newly auto-added): persist + app contact update.
+            await self._fire_callbacks("advert_received", applied)
+        # Firmware parity (BaseChatMesh::onAdvertRecv -> onDiscoveredContact):
+        # notify the client for *every* valid advert (stored or not). The frame
+        # layer decides full NEW_ADVERT vs short ADVERT by whether the contact
+        # ended up in the store.
+        disc_contact = applied if applied is not None else contact
+        await self._fire_callbacks("node_discovered", disc_contact)
 
     async def _handle_new_message(self, data: dict) -> None:
         # Deduplicate by packet hash so reconnects don't queue the same packet multiple times.
