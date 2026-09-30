@@ -81,8 +81,13 @@ class _PushMixin:
         """The companion rebooted (reloaded its settings): save contacts, as
         firmware does before resetting, and drop the app so it reconnects and
         re-reads everything."""
-        await self._save_contacts()
+        # The app that asked for the reboot, not whichever one connects while
+        # contacts are saving.
         writer = self._client_writer
+        try:
+            await self._save_contacts()
+        except Exception as e:
+            logger.error("Companion reboot: saving contacts failed: %s", e)
         if writer is not None:
             logger.info("Companion reboot: dropping client (port=%s)", self.port)
             try:

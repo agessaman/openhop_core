@@ -1757,6 +1757,8 @@ class SX1262Radio(LoRaRadio):
             return
         try:
             task_loop = pending.get_loop()
+            if task_loop.is_closed():
+                raise RuntimeError("its event loop is closed")
             try:
                 on_task_loop = asyncio.get_running_loop() is task_loop
             except RuntimeError:

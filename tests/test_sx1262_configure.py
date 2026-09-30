@@ -222,11 +222,13 @@ def test_cleanup_survives_a_queued_reconfigure_whose_loop_is_closed():
         loop.run_until_complete(queue_one())
     finally:
         loop.close()
-    assert radio.pending_configure is not None
+    pending = radio.pending_configure
+    assert pending is not None
 
     radio.cleanup()  # must not raise
 
     radio.lora.end.assert_called_once()
+    assert pending.get_coro().cr_frame is None  # closed, not left unawaited
 
 
 async def test_a_failed_queued_reconfigure_is_logged_and_cleared(radio, caplog):

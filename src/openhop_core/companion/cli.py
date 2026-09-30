@@ -198,9 +198,10 @@ class CompanionCLI:
         command = command.lstrip(" ")
         prefix = ""
         # Optional "XX|" prefix from the companion app, reflected back so the
-        # app can match a reply to its command.
-        if len(command.encode("utf-8")) > 4 and command[2:3] == "|":
-            prefix, command = command[:3], command[3:]
+        # app can match a reply to its command. Firmware indexes bytes.
+        raw = command.encode("utf-8")
+        if len(raw) > 4 and raw[2:3] == b"|":
+            prefix, command = raw[:3].decode("utf-8"), raw[3:].decode("utf-8")
 
         try:
             reply = self._dispatch(command, sender_timestamp)

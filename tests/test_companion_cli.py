@@ -1871,6 +1871,7 @@ class TestCompanionCLIPrefixEdges:
             "abx|get name",  # command[2] is not '|'
             "ab||",
             "a|get name",  # strlen <= 4
+            "a\u00e9|get name",  # command[2] is the second byte of the '\u00e9'
         ],
     )
     def test_a_command_without_a_recognised_prefix_is_dispatched_whole(self, command):
@@ -1904,6 +1905,12 @@ class TestCompanionCLIPrefixEdges:
         """Firmware skips ``' '`` only, and a tab-prefixed command is not a match
         for any branch either -- so the answer is the same on both sides."""
         assert _make_bridge(node_name="N").cli.handle("\tget name") == UNKNOWN_COMMAND
+
+    def test_the_prefix_is_found_by_byte_not_by_character(self):
+        """'\u00e9' is two bytes, so its '|' is command[2] to firmware."""
+        cli = _make_bridge(node_name="N").cli
+
+        assert cli.handle("\u00e9|get name") == "\u00e9|> N"
 
     def test_a_prefix_on_a_command_that_does_not_exist_is_still_reflected(self):
         cli = _make_bridge(node_name="N").cli
@@ -2402,6 +2409,40 @@ class TestReboot:
             await _drain_background_tasks(bridge)
         assert frames == []
         assert writer.closed is True
+
+    @pytest.mark.asyncio
+    async def test_a_failed_contact_save_still_drops_the_client(self):
+        bridge = _make_bridge()
+        server, frames = _capture_server(bridge)
+        server._setup_push_callbacks()
+        writer = _FakeWriter()
+        server._client_writer = writer
+        with patch.object(
+            server, "_save_contacts", AsyncMock(side_effect=RuntimeError("sqlite is locked"))
+        ):
+            await server._handle_cmd(bytes([CMD_REBOOT]) + b"reboot")
+            await _drain_background_tasks(bridge)
+        assert frames == []
+        assert writer.closed is True
+
+    @pytest.mark.asyncio
+    async def test_reboot_drops_the_client_that_asked_not_one_that_connected_since(self):
+        """An app that connects while contacts are saving is already a fresh
+        session; only the rebooting one is dropped."""
+        bridge = _make_bridge()
+        server, _ = _capture_server(bridge)
+        server._setup_push_callbacks()
+        rebooting, newcomer = _FakeWriter(), _FakeWriter()
+        server._client_writer = rebooting
+
+        async def reconnect_during_save():
+            server._client_writer = newcomer
+
+        with patch.object(server, "_save_contacts", AsyncMock(side_effect=reconnect_during_save)):
+            await server._handle_cmd(bytes([CMD_REBOOT]) + b"reboot")
+            await _drain_background_tasks(bridge)
+        assert rebooting.closed is True
+        assert newcomer.closed is False
 
     @pytest.mark.asyncio
     async def test_a_command_queued_behind_reboot_still_gets_its_reply(self):
