@@ -7,6 +7,7 @@ web handler) stalled for the full timeout and the change was then dropped.
 """
 
 import asyncio
+import contextlib
 import struct
 import threading
 import time
@@ -390,7 +391,8 @@ async def test_an_awaited_reconfigure_supersedes_a_queued_one(radio):
     radio._tx_lock.release()
 
     assert await newer is True
-    await asyncio.sleep(0)
+    with contextlib.suppress(asyncio.CancelledError):
+        await queued  # however late the cancel lands (Python < 3.12's wait_for)
     assert queued.cancelled()
     assert _retuned_to(radio) == [869618000]
     assert radio.frequency == 869618000

@@ -9,6 +9,7 @@ import logging
 import math
 import random
 import time
+import weakref
 from typing import Optional, Union
 
 from ..protocol.packet_utils import calculate_lora_airtime_ms, coding_rate_denominator
@@ -1755,6 +1756,11 @@ class SX1262Radio(LoRaRadio):
         self._pending_configure = None
         if pending is None or pending.done():
             return
+        # Python < 3.12's wait_for can drop a cancel that lands as the lock is
+        # granted, so the task also checks this once it holds the lock.
+        if getattr(self, "_superseded_configures", None) is None:
+            self._superseded_configures = weakref.WeakSet()
+        self._superseded_configures.add(pending)
         try:
             task_loop = pending.get_loop()
             if task_loop.is_closed():
@@ -1812,6 +1818,10 @@ class SX1262Radio(LoRaRadio):
                 self.CONFIGURE_TX_WAIT_SECONDS,
             )
             return False
+        superseded = getattr(self, "_superseded_configures", None)
+        if superseded is not None and asyncio.current_task() in superseded:
+            self._tx_lock.release()
+            raise asyncio.CancelledError()
         try:
             if not self._initialized or self.lora is None:
                 return False
