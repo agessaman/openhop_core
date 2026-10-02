@@ -29,6 +29,7 @@ from .base_support import ResponseWaiter  # noqa: F401
 from .base_support import adv_type_to_flags  # noqa: F401
 from .base_support import _SeenCache
 from .channel_store import ChannelStore
+from .cli import CliCommandHook, CompanionCLI
 from .constants import (
     ADV_TYPE_CHAT,
     DEFAULT_MAX_CHANNELS,
@@ -104,10 +105,7 @@ class CompanionBase(
             node_name=node_name,
             adv_type=adv_type,
             tx_power_dbm=self._radio_config.get("power", self._radio_config.get("tx_power", 20)),
-            frequency_hz=self._radio_config.get("frequency", 915000000),
-            bandwidth_hz=self._radio_config.get("bandwidth", 250000),
-            spreading_factor=self._radio_config.get("spreading_factor", 10),
-            coding_rate=self._radio_config.get("coding_rate", 5),
+            **self._configured_radio_prefs(),
         )
 
         self._custom_vars: dict[str, str] = {}
@@ -150,6 +148,16 @@ class CompanionBase(
         # Fire-and-forget tasks kept alive until done (see _spawn_background_task)
         self._background_tasks: set[asyncio.Task] = set()
 
+        # The local CLI (CMD_RUN_CLI_COMMAND and the remote CLI). A host adds its
+        # own commands through ``cli_command_hook`` (see companion/cli.py).
+        self.cli = CompanionCLI(self)
+        self.cli_command_hook: Optional[CliCommandHook] = None
+        # Remote CLI replies waiting out CLI_REPLY_DELAY_MS; cancelled on stop().
+        self._remote_cli_replies: set[asyncio.Task] = set()
+        # Set by stop(), cleared by start(). Not ``_running``: a host may never
+        # call start() (openhop_repeater does not for its bridges).
+        self._remote_cli_closed = False
+
         # Event-level de-dup caches keep reconnects from re-queuing text.
         self._seen_grp_txt = _SeenCache(ttl=60.0, max_size=4096)
         self._seen_txt = _SeenCache()
@@ -166,6 +174,16 @@ class CompanionBase(
         # Optional bulk load of contacts (e.g. from persistence on boot).
         if initial_contacts is not None:
             self.contacts.load_from(initial_contacts)
+
+    def _configured_radio_prefs(self) -> dict:
+        """The radio prefs ``radio_config`` implies, with the defaults used
+        when it is silent. Prefs start from these."""
+        return {
+            "frequency_hz": self._radio_config.get("frequency", 915000000),
+            "bandwidth_hz": self._radio_config.get("bandwidth", 250000),
+            "spreading_factor": self._radio_config.get("spreading_factor", 10),
+            "coding_rate": self._radio_config.get("coding_rate", 5),
+        }
 
     def _check_and_track_group_packet(self, packet: Packet) -> bool:
         """Record a group packet and report whether it was recently seen."""

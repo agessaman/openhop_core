@@ -2,16 +2,24 @@
 
 from __future__ import annotations
 
+import asyncio
 import logging
 import struct
 import time
 from typing import Optional
 
 from ..node.events import MeshEvents
-from ..protocol import Packet
-from ..protocol.constants import ROUTE_TYPE_FLOOD, ROUTE_TYPE_TRANSPORT_FLOOD
+from ..protocol import Packet, PacketBuilder
+from ..protocol.constants import (
+    MAX_TEXT_LEN,
+    ROUTE_TYPE_FLOOD,
+    ROUTE_TYPE_TRANSPORT_FLOOD,
+    TXT_TYPE_CLI_COMMAND,
+    TXT_TYPE_CLI_DATA,
+)
 from ..protocol.crypto import CryptoUtils
 from ..protocol.utils import derive_channel_hash, normalize_channel_secret
+from .constants import CLI_REPLY_DELAY_MS
 from .models import (
     Channel,
     ChannelDataEvent,
@@ -112,6 +120,25 @@ class _RxEventsMixin:
         sender_key = bytes.fromhex(sender_key_hex) if sender_key_hex else b""
         # Handler publishes "message_text"; accept "text" for compatibility
         message_text = (data.get("message_text") or data.get("text") or "").rstrip("\x00")
+
+        # A CLI command from a contact the app has allowed to use the remote CLI
+        # runs here and is answered, not queued (BaseChatMesh::onPeerDataRecv ->
+        # MyMesh::onCLICommandRecv). Anyone else's is queued as txt_type 3.
+        if data.get("txt_type") == TXT_TYPE_CLI_COMMAND:
+            contact = self.contacts.get_by_key(sender_key) if sender_key else None
+            if contact is not None and contact.is_remote_cli_allowed:
+                if self._remote_cli_closed:
+                    return  # stopped: run nothing, transmit nothing
+                sender_timestamp = int(data.get("timestamp") or 0)
+                reply = self.run_cli_command(message_text, sender_timestamp)
+                if reply:
+                    task = self._spawn_background_task(
+                        self._send_remote_cli_reply(sender_key, reply, sender_timestamp),
+                        "remote CLI reply",
+                    )
+                    self._remote_cli_replies.add(task)
+                    task.add_done_callback(self._remote_cli_replies.discard)
+                return
         # Extract SNR/RSSI from network info if available (same as channel path)
         network_info = data.get("network_info", {})
         snr = network_info.get("snr")
@@ -155,6 +182,38 @@ class _RxEventsMixin:
                 queue_entry=msg if was_queued else None,
             ),
         )
+
+    async def _send_remote_cli_reply(
+        self, sender_key: bytes, reply: str, sender_timestamp: int
+    ) -> None:
+        """Answer a remote CLI command the way firmware does: a CLI_DATA text
+        with attempt 0 and no ACK, after CLI_REPLY_DELAY_MS, direct on the
+        contact's path when known and flooded in this companion's scope
+        otherwise (``send_text_message`` picks the route)."""
+        await asyncio.sleep(CLI_REPLY_DELAY_MS / 1000.0)
+        timestamp = PacketBuilder._get_timestamp()
+        if timestamp == sender_timestamp:
+            # Firmware: the two timestamps must differ in the app's CLI view.
+            # The unique clock is strictly increasing, so asking again gives the
+            # next second and keeps it from being handed out twice.
+            timestamp = PacketBuilder._get_timestamp()
+        text = reply.encode("utf-8")[:MAX_TEXT_LEN].decode("utf-8", errors="ignore")
+        await self.send_text_message(
+            sender_key,
+            text,
+            txt_type=TXT_TYPE_CLI_DATA,
+            attempt=0,
+            wait_for_ack=False,
+            timestamp=timestamp,
+        )
+
+    def _cancel_remote_cli_replies(self) -> None:
+        """Drop remote CLI replies still waiting out their delay, so a stopped
+        companion transmits nothing further."""
+        self._remote_cli_closed = True
+        for task in list(self._remote_cli_replies):
+            task.cancel()
+        self._remote_cli_replies.clear()
 
     async def _handle_new_channel_message(self, data: dict) -> None:
         # Do not push our own (outgoing) channel messages to the client as incoming.

@@ -46,6 +46,7 @@ _PUSH_SUBSCRIPTIONS = (
     ("contacts_full", "_on_contacts_full"),
     ("raw_data_received", "_on_raw_data_received"),
     ("trace_received", "_on_trace_received"),
+    ("reboot", "_on_reboot"),
 )
 
 
@@ -75,6 +76,24 @@ class _PushMixin:
     # -------------------------------------------------------------------------
     # Bridge event callbacks (registered by _setup_push_callbacks)
     # -------------------------------------------------------------------------
+
+    async def _on_reboot(self) -> None:
+        """The companion rebooted (reloaded its settings): save contacts, as
+        firmware does before resetting, and drop the app so it reconnects and
+        re-reads everything."""
+        # The app that asked for the reboot, not whichever one connects while
+        # contacts are saving.
+        writer = self._client_writer
+        try:
+            await self._save_contacts()
+        except Exception as e:
+            logger.error("Companion reboot: saving contacts failed: %s", e)
+        if writer is not None:
+            logger.info("Companion reboot: dropping client (port=%s)", self.port)
+            try:
+                writer.close()
+            except Exception:
+                pass
 
     async def _on_message_event(self, event: MessageEvent):
         msg_dict = {
