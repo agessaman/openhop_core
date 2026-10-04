@@ -2679,6 +2679,126 @@ class TestStopIoThreadsEndsThePreviousGeneration:
         assert not reader.is_alive(), "the previous generation reader outlived the stop"
 
 
+class TestWorkersBoundToTheirSerialHandle:
+    """A worker belongs to the handle it was started on, not to self.serial_conn.
+
+    Recovery closes a handle from another thread while its reader is blocked in
+    read(); pyserial then fails on fd=None with "'NoneType' object cannot be
+    interpreted as an integer". That teardown was logged as a fresh RX error and
+    marked the link degraded again, possibly closing the next generation's port.
+    """
+
+    def test_rx_worker_never_reads_from_a_replacement_handle(self):
+        modem = KissModemWrapper(port="/dev/null", auto_configure=False)
+        replacement = MagicMock()
+        replacement.is_open = True
+
+        class OldSerial:
+            is_open = True
+            read_count = 0
+            in_waiting = 0
+
+            def read(self, _size):
+                self.read_count += 1
+                modem.serial_conn = replacement
+                return b""
+
+        old = OldSerial()
+        modem.serial_conn = old
+        modem._rx_worker(old)
+
+        assert old.read_count == 1
+        replacement.read.assert_not_called()
+
+    def test_rx_close_race_is_teardown_not_a_new_failure(self):
+        modem = KissModemWrapper(port="/dev/null", auto_configure=False)
+
+        class ClosingSerial:
+            is_open = True
+
+            def read(self, _size):
+                modem.serial_conn = None
+                self.is_open = False
+                raise TypeError("'NoneType' object cannot be interpreted as an integer")
+
+        conn = ClosingSerial()
+        modem.serial_conn = conn
+        modem._mark_serial_failure = MagicMock()
+
+        modem._rx_worker(conn)
+
+        modem._mark_serial_failure.assert_not_called()
+
+    def test_failure_on_the_live_handle_still_marks_the_link_degraded(self):
+        modem = KissModemWrapper(port="/dev/null", auto_configure=False)
+
+        class BrokenSerial:
+            is_open = True
+
+            def read(self, _size):
+                raise OSError(5, "Input/output error")
+
+        conn = BrokenSerial()
+        modem.serial_conn = conn
+        modem._mark_serial_failure = MagicMock()
+
+        modem._rx_worker(conn)
+
+        modem._mark_serial_failure.assert_called_once()
+        assert "Input/output error" in modem._mark_serial_failure.call_args.args[0]
+
+    def test_tx_worker_leaves_the_queue_to_the_live_handle(self):
+        modem = KissModemWrapper(port="/dev/null", auto_configure=False)
+        old = MagicMock()
+        old.is_open = True
+        modem.serial_conn = MagicMock()
+        modem.serial_conn.is_open = True
+        modem.tx_buffer.append(b"frame")
+        modem._write_frame = MagicMock(return_value=True)
+
+        modem._tx_worker(old)
+
+        modem._write_frame.assert_not_called()
+        assert list(modem.tx_buffer) == [b"frame"]
+
+    def test_close_detaches_before_touching_the_handle(self):
+        modem = KissModemWrapper(port="/dev/null", auto_configure=False)
+        calls = []
+
+        class TrackingSerial:
+            is_open = True
+
+            def cancel_read(self):
+                calls.append(("cancel_read", modem.serial_conn))
+
+            def cancel_write(self):
+                calls.append(("cancel_write", modem.serial_conn))
+
+            def close(self):
+                calls.append(("close", modem.serial_conn))
+                self.is_open = False
+
+        conn = TrackingSerial()
+        modem.serial_conn = conn
+        modem._close_serial_connection()
+
+        assert calls == [("cancel_read", None), ("cancel_write", None), ("close", None)]
+        assert conn.is_open is False
+
+    def test_close_survives_cancel_failures(self):
+        modem = KissModemWrapper(port="/dev/null", auto_configure=False)
+        conn = MagicMock()
+        conn.is_open = True
+        conn.cancel_read.side_effect = OSError("unsupported")
+        conn.cancel_write.side_effect = OSError("unsupported")
+        modem.serial_conn = conn
+
+        modem._close_serial_connection()
+
+        assert modem.serial_conn is None
+        conn.close.assert_called_once()
+
+
 class TestRxCallbackDisarmRace:
     """RX dispatch must tolerate the callback being cleared concurrently.
 
