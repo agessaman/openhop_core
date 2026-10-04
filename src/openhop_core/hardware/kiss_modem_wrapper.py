@@ -307,6 +307,12 @@ class KissModemWrapper(LoRaRadio):
                          of full-duplex modem on a physically half-duplex link, where a
                          host "is channel busy?" check can delay submitting the next frame
                          to avoid collisions.
+            usb_reset_on_connect: If True, pulse DTR during modem startup. Off by
+                         default, and never inferred from the port path: dropping
+                         DTR while RTS is asserted resets most ESP32 boards
+                         (auto-reset circuits on CP210x/CH340 bridges, and the
+                         on-chip logic of ESP32-S3 native USB-Serial-JTAG), and a
+                         native-USB modem then re-enumerates under the open port.
         """
         self.port = port
         self.baudrate = baudrate
@@ -316,10 +322,7 @@ class KissModemWrapper(LoRaRadio):
         self.connect_retries = max(1, int(connect_retries))
         self.post_open_delay_ms = max(0, int(post_open_delay_ms))
         self.startup_retry_budget_sec = max(1.0, float(startup_retry_budget_sec))
-        if usb_reset_on_connect is None:
-            self.usb_reset_on_connect = str(port).startswith("/dev/serial/by-id/")
-        else:
-            self.usb_reset_on_connect = bool(usb_reset_on_connect)
+        self.usb_reset_on_connect = bool(usb_reset_on_connect)
         self._shutting_down = False
 
         self.radio_config = radio_config or {}
@@ -599,10 +602,9 @@ class KissModemWrapper(LoRaRadio):
         """Return (vid, pid, serial_number) for *device*, or None if unavailable.
 
         Matches on the resolved path, not the configured string: a port is often
-        given as an alias (/dev/serial/by-id/..., or a udev-named /dev/openhop-modem
-        -- the constructor already treats the former specially) which never appears
-        verbatim in comports(), and a literal comparison would leave exactly those
-        setups with no identity to recover by.
+        given as an alias (/dev/serial/by-id/..., or a udev-named /dev/openhop-modem)
+        which never appears verbatim in comports(), and a literal comparison would
+        leave exactly those setups with no identity to recover by.
         """
         target = os.path.realpath(device)
         try:

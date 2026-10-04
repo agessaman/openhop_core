@@ -2747,6 +2747,59 @@ class TestSerialPortOpen:
         """The firmware implements no RTS/CTS flow control on the RX pipe."""
         assert self._connect_with_fake_serial().get("rtscts") is False
 
+    class _DtrTrackingSerial:
+        def __init__(self):
+            self.is_open = True
+            self.dtr_writes = []
+            self._dtr = True
+
+        @property
+        def dtr(self):
+            return self._dtr
+
+        @dtr.setter
+        def dtr(self, value):
+            self.dtr_writes.append(value)
+            self._dtr = value
+
+        def reset_input_buffer(self):
+            pass
+
+        def reset_output_buffer(self):
+            pass
+
+        def write(self, data):
+            return len(data)
+
+        def flush(self):
+            pass
+
+    def _wait_for_ready(self, **kwargs):
+        modem = KissModemWrapper(auto_configure=False, post_open_delay_ms=0, **kwargs)
+        conn = self._DtrTrackingSerial()
+        modem.serial_conn = conn
+        modem._send_command = MagicMock(return_value=(RESP_PONG, b""))
+        with patch("threading.Event.wait", return_value=None):
+            assert modem._wait_for_modem_ready() is True
+        return modem, conn
+
+    def test_by_id_port_does_not_imply_usb_reset(self):
+        """A stable /dev/serial/by-id path is how most ESP32 modems are configured.
+
+        Inferring a DTR reset from it rebooted ESP32-S3 native-USB modems on every
+        open: the device re-enumerated under the just-opened port, the readiness
+        PING timed out, and recovery reopened and reset it again, indefinitely.
+        """
+        modem, conn = self._wait_for_ready(
+            port="/dev/serial/by-id/usb-Espressif_Systems_Station_G3_ESP32-if00"
+        )
+        assert modem.usb_reset_on_connect is False
+        assert conn.dtr_writes == []
+
+    def test_explicit_usb_reset_still_pulses_dtr(self):
+        modem, conn = self._wait_for_ready(port="/dev/ttyACM0", usb_reset_on_connect=True)
+        assert conn.dtr_writes == [False, True]
+
 
 class TestKissPortRecovery:
     """Reconnect follows a renamed node, and says when a port is not coming back."""
