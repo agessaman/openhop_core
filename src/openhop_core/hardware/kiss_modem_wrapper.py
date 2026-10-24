@@ -1297,6 +1297,22 @@ class KissModemWrapper(LoRaRadio):
     def supports_fem_tx_gain(self) -> bool:
         return bool(self.get_hardware_capabilities() & HW_CAP_FEM_TX_GAIN)
 
+    @staticmethod
+    def effective_agc_reset_interval(seconds: int) -> Optional[int]:
+        """The interval KISS firmware will run, or None if it will reject it.
+
+        Firmware rounds down to a multiple of 4, so 1-3 disable the reset.
+        """
+        if isinstance(seconds, bool):
+            return None
+        try:
+            value = int(seconds)
+        except (TypeError, ValueError):
+            return None
+        if not 0 <= value <= AGC_RESET_INTERVAL_MAX_SEC:
+            return None
+        return value - (value % AGC_RESET_INTERVAL_STEP_SEC)
+
     def set_agc_reset_interval(self, seconds: int) -> Optional[int]:
         """Set the modem's periodic AGC reset interval.
 

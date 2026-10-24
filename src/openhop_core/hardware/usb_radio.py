@@ -40,6 +40,7 @@ from typing import Callable, Optional
 import serial
 from serial.tools import list_ports
 
+from .frame_rf_frontend import FrameRfControls
 from .protocol_constants import (
     CMD_CAD_PARAMS_RESP,
     CMD_CAD_REQUEST,
@@ -104,7 +105,7 @@ else:
         pass
 
 
-class USBLoRaRadio(_RadioBase):
+class USBLoRaRadio(_RadioBase, FrameRfControls):
     """USB LoRa Radio — openhop_core LoRaRadio interface over USB-CDC serial.
 
     Communicates with an openHop Modem over a USB-CDC serial link.
@@ -127,6 +128,7 @@ class USBLoRaRadio(_RadioBase):
         lbt_max_attempts: int = 5,
         lbt_max_wait_seconds: float = 4.0,
         lbt_retry_interval_ms: int = 200,
+        radio_config: Optional[dict] = None,
     ):
         self.port = port
         self.baudrate = baudrate
@@ -203,6 +205,7 @@ class USBLoRaRadio(_RadioBase):
             f"sf={spreading_factor}, bw={bandwidth / 1000:.0f}kHz, "
             f"power={tx_power}dBm, syncword=0x{sync_word:04X}"
         )
+        self._init_rf_controls(radio_config)
 
     # ══════════════════════════════════════════════════════════
     # LoRaRadio interface implementation
@@ -887,6 +890,7 @@ class USBLoRaRadio(_RadioBase):
             )
             if not self._apply_cad_config_sync():
                 logger.warning("Radio configured but cached CAD settings were not restored")
+            self.apply_saved_rf_controls()
             return True
         elif resp and resp[0] == CMD_ERROR:
             err = resp[1][0] if len(resp) > 1 and len(resp[1]) > 0 else 0xFF
@@ -1102,13 +1106,16 @@ class USBLoRaRadio(_RadioBase):
             else:
                 logger.warning(f"Modem error: 0x{err_code:02X}")
             self._last_modem_error = err_code
-            # Also signal any waiting command in case the error
-            # is a response to our command
             with self._response_lock:
-                for evt_cmd, evt in list(self._response_events.items()):
-                    self._response_data[evt_cmd] = None
-                    if self._event_loop:
-                        self._event_loop.call_soon_threadsafe(evt.set)
+                if self._deliver_waiting_frame(CMD_ERROR, payload):
+                    pass
+                elif self._rf_note_unsolicited(CMD_ERROR, payload):
+                    pass
+                else:
+                    for evt_cmd, evt in list(self._response_events.items()):
+                        self._response_data[evt_cmd] = None
+                        if self._event_loop:
+                            self._event_loop.call_soon_threadsafe(evt.set)
 
         elif cmd == CMD_TX_FAIL:
             # The TX request reached the radio but the chip never asserted
@@ -1124,13 +1131,9 @@ class USBLoRaRadio(_RadioBase):
                         self._event_loop.call_soon_threadsafe(evt.set)
 
         else:
-            # ── Command response ─────────────────────────────
             with self._response_lock:
-                if cmd in self._response_events:
-                    self._response_data[cmd] = payload
-                    evt = self._response_events[cmd]
-                    if self._event_loop:
-                        self._event_loop.call_soon_threadsafe(evt.set)
+                if not self._deliver_waiting_frame(cmd, payload):
+                    self._rf_note_unsolicited(cmd, payload)
 
     # ── Async command/response ────────────────────────────────
 
